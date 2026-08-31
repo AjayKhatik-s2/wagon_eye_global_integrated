@@ -1,30 +1,53 @@
-# WagonEye v4 — Train-State-Native Production Pipeline
+# WagonEye — global_wagon_app counting + the f3d2d81 downstream pipeline
+
+An integration of two validated projects:
+
+| | Project | Role |
+|---|---|---|
+| 1 | **`global_wagon_app`** ([`global_count_ec2`](https://github.com/AjayKhatik-s2/global_count_ec2)) | Stage-1 counting: the authoritative global wagon timeline |
+| 2 | **this repository** (from `final_version_wagon` @ `f3d2d81`) | everything downstream: Door / Load / Damage / OCR, fusion, rendering, reporting, delivery |
 
 Single source of truth for wagon counting, numbering, and classification
-is the **GlobalTrainState** produced by `wagon_count/`. Everything
-downstream — frame extraction, feature inference, fusion, reporting —
-consumes that state and never recounts wagons, never re-segments video,
-never re-runs gap detection.
+is the **GlobalTrainState** produced by the external counting engine.
+Everything downstream — frame extraction, feature inference, fusion,
+reporting — consumes that state and never recounts wagons, never re-segments
+video, never re-runs gap detection.
+
+The engine is a **separate repository, deliberately not vendored here**, so the
+validated counting algorithm has exactly one source of truth. See
+[`global_counting/README.md`](global_counting/README.md) for the engine
+contract, the import-isolation design, and rollback.
 
 ```
 4 source videos
     │
     ▼
 [Stage 1] reconstruction.runner  →  global_state/global_train_state.json
-            SOLE counting authority (wagon_count/, fixed-master fusion):
-              fragment reassembly → gap validation → WAGON_ACTIVE recovery
-              → master classification + temporal smoothing
-              → per-camera clock-offset estimation
-              → global gaps == validated RIGHT_UP gaps
+            SOLE counting authority: the external global_wagon_app engine,
+            driven by global_counting/{runner,adapter}.py:
+              classification → wagon-region trimming → gap detection
+              → gap tracking → unique-gap confirmation
+              → 0–1000 normalization
+              → DYNAMIC master-camera selection (max confirmed unique gaps)
+              → cross-camera alignment (scale + direction, reversal aware)
+              → missing-gap recovery
+              → GLOBAL GAP TIMELINE → GLOBAL WAGON TIMELINE
+              → GLOBAL_WAGON_COUNT = GLOBAL_GAP_COUNT − 1
               → wagon window (ENGINE / BRAKE_VAN get no GW id)
+              → per-wagon ALIGNED frame range for each of the 4 cameras
             Emits one IMMUTABLE roster GW_1..GW_N.  No later stage may
             count, re-segment, renumber or reorder it.
-            + wagon_count tracking overlay mp4s (debug artifacts)
-            → global_state/processed_videos/<CAM>_processed.mp4
+            The retained wagon_count subprocess counter stays selectable
+            for rollback (--stage1-engine wagon_count); exactly one engine
+            ever runs per batch.
     │
     ▼
 [Stage 2] materializer.wagon_cache_builder
             single-pass per video → wagon_cache/<GW_n>/<camera>/*.jpg
+            uses each wagon's ALIGNED per-camera frame range when the
+            counting engine supplies one, instead of projecting
+            master_time × local_fps (the four cameras are not guaranteed
+            to share t=0, and one may run reversed)
     │
     ▼
 [Stage 3] features.load  runs FIRST, to completion
@@ -230,40 +253,137 @@ batch_outputs/<batch_key>/
 └── archive/                           run logs (future)
 ```
 
-## Quick start
+## Deployment (EC2, CPU)
+
+### 1. Install
 
 ```bash
-# 1) Install dependencies
-pip install -r requirements.txt
+git clone <this repo> wagon_eye_global_integrated
+cd wagon_eye_global_integrated
+WITH_OCR=0 bash scripts/setup_ec2.sh        # drop WITH_OCR=0 if you want OCR
+```
 
-# 2) Drop the .pt model files into (exact filenames — no aliases):
-#       wagon_eye_v4/models/reconstruction/     (4 required + 1 optional)
-#           right_up_wagon_gap.pt
-#           left_up_wagon_gap.pt
-#           top_gap.pt
-#           side_classification.pt
-#           top_classification.pt   OPTIONAL — refines TOP-camera
-#                                   classification; never a counting
-#                                   authority, so a missing file only
-#                                   degrades labelling, never the count.
-#       wagon_eye_v4/models/features/
-#           door_state.pt
-#           loaded.pt
-#           damage.pt
-#           wagon_id_counting.pt
+`scripts/setup_ec2.sh` creates `.venv`, installs `requirements.txt`, clones (or
+fast-forwards) the **external counting engine**, installs the engine's own
+requirements, writes `wagoneye.env`, and finishes with preflight. Every path is
+an environment variable with a default relative to `$HOME` or the repo —
+nothing is hardcoded:
 
-# 3) Local single-batch (no S3):
-mkdir -p wagon_eye_v4/local_inputs
-# copy 4 trimmed train videos in -- filenames must contain
-# 'right_up' / 'left_up' / 'right_up_top' / 'left_up_top'
-cd wagon_eye_v4
-python -m orchestrator.master_runner --local-only --local-inputs ./local_inputs
+| Variable | Default | Meaning |
+|---|---|---|
+| `ENGINE_DIR` | `~/global_count_ec2` | where the counting engine is cloned |
+| `RECON_MODELS_DIR` | `~/global_wagon_models` | the five counting weights |
+| `FEAT_MODELS_DIR` | `<repo>/models/features` | the feature weights |
+| `VENV_DIR` | `<repo>/.venv` | virtualenv |
+| `WITH_OCR` | `1` | `0` skips the heavy `easyocr` install |
 
-# 4) Continuous S3 polling (production):
-python -m orchestrator.master_runner --auto
+At runtime the same locations are read from the environment, so the run command
+stays short:
 
-# 5) Single-batch replay:
-python -m orchestrator.master_runner --batch 20260408_032134
+```bash
+source wagoneye.env
+#   GLOBAL_WAGON_APP_DIR
+#   WAGONEYE_RECON_MODELS_DIR
+#   WAGONEYE_FEAT_MODELS_DIR
+#   WAGONEYE_STAGE1_ENGINE      (optional; wagon_count to roll back)
+```
+
+`GLOBAL_WAGON_APP_DIR` may point at the clone **or** at the `global_wagon_app/`
+package inside it, and `~` / `$VARS` are expanded. Per-run overrides:
+`--global-engine-dir`, `--recon-models-dir`, `--feat-models-dir`.
+
+### 2. Weights
+
+Weights are never committed. These are the filenames the code actually opens —
+if your copy spells them differently, **rename on download**; do not duplicate
+weights into several folders.
+
+Stage 1, in `$RECON_MODELS_DIR` (`global_counting/runner.py: MODEL_SLOTS`):
+
+| Slot | Canonical name | Also accepted |
+|---|---|---|
+| side classification | `side_classification.pt` | `side_classify.pt`, `side.pt` |
+| top classification | `top_classification.pt` | `top_classify.pt`, `top.pt` |
+| right gap | `right_up_wagon_gap.pt` | `right_up_gap.pt`, `right_gap.pt`, `right_wagon_gap.pt` |
+| left gap | `left_up_wagon_gap.pt` | `left_up_gap.pt`, `left_gap.pt`, `left_wagon_gap.pt` |
+| top gap | `top_gap.pt` | `top_up_gap.pt`, `top_wagon_gap.pt` |
+
+The canonical column is `core/constants.py`; the aliases exist because both
+spellings occur in real model drops. Preflight prints which file matched.
+
+Stage 3, in `$FEAT_MODELS_DIR` — exact names, no aliases:
+
+| Feature | Filename | Constant |
+|---|---|---|
+| door | `door_state.pt` | `C.MODEL_DOOR_STATE` |
+| load | `loaded.pt` | `C.MODEL_LOADED` |
+| damage | `damage.pt` | `C.MODEL_DAMAGE` |
+| ocr | `wagon_id_counting.pt` | `C.MODEL_WAGON_ID_COUNTING` |
+
+### 3. Videos
+
+Four videos, one per camera, in one folder. A filename must contain one of its
+camera's accepted spellings — the two TOP cameras also accept the CCTV
+exporter's `RIGHT_TOP` / `LEFT_TOP` form
+(`core/constants.py: CAMERA_FILENAME_ALIASES`). Matching is longest-alias-first,
+so `RIGHT_UP` never captures `RIGHT_UP_TOP`:
+
+```
+camera_..._2_RIGHT_UP_...mp4     -> RIGHT_UP
+camera_..._1_LEFT_UP_...mp4      -> LEFT_UP
+camera_..._5_RIGHT_TOP_...mp4    -> RIGHT_UP_TOP
+camera_..._6_LEFT_TOP_...mp4     -> LEFT_UP_TOP
+```
+
+S3 input lives under `s3://complete-train2/new_local/`; `--auto` polls it.
+
+### 4. Preflight
+
+Checks interpreter, wheels, the engine, all weights, the four videos and the
+workspace **without loading a model or decoding a frame**. Exit 0 = ready.
+
+```bash
+python scripts/preflight.py     --local-inputs ~/wagon_eye_inputs/fresh_train     --recon-models-dir ~/global_wagon_models     --features door,load,damage
+```
+
+### 5. Run
+
+Long CPU runs must survive a dropped SSH session:
+
+```bash
+tmux new -s wagoneye
+
+cd ~/wagon_eye_global_integrated
+source .venv/bin/activate
+source wagoneye.env
+
+python -m orchestrator.master_runner     --local-only     --local-inputs ~/wagon_eye_inputs/fresh_train     --recon-models-dir ~/global_wagon_models     --feat-models-dir ~/wagon_eye_global_integrated/models/features     --features door,load,damage     --no-interactive     --skip-upload --skip-email     2>&1 | tee ~/wagoneye_run.log
+
+# detach: Ctrl-b d      reattach: tmux attach -t wagoneye
+```
+
+`--features door,load,damage` skips OCR entirely: `features.ocr.processor` is
+never imported, EasyOCR is never initialized, `wagon_id_counting.pt` is never
+loaded, and OCR is never submitted to the Stage-3 executor. Fusion and the
+reports mark it `DISABLED BY USER` through the pipeline's existing sentinel
+path, and the PDF is still produced. OCR stays available with `--features all`
+or `--features ocr`.
+
+### 6. Publish — only after inspecting the local output
+
+```bash
+BATCH=$(ls -1t batch_outputs | head -1)
+aws s3 cp batch_outputs/$BATCH/reports/     s3://complete-train2/new_local/$BATCH/reports/ --recursive     --exclude "*" --include "*.pdf" --include "*.json"
+```
+
+Or drop `--skip-upload` to let Stage 6 deliver.
+
+## Other run modes
+
+```bash
+python -m orchestrator.master_runner --auto                    # S3 polling
+python -m orchestrator.master_runner --batch 20260408_032134   # replay
+python -m orchestrator.master_runner --stage1-engine wagon_count ...  # rollback
 ```
 
 ## Tests
@@ -302,6 +422,9 @@ Tests that compare the engine against its source folder skip cleanly when
 | `--workspace DIR`           | Output root (default: `./batch_outputs`).             |
 | `--recon-models-dir DIR`    | Override `models/reconstruction/`.                    |
 | `--feat-models-dir DIR`     | Override `models/features/`.                          |
+| `--features LIST`           | Features to RUN: `all` or e.g. `door,load,damage`. Inverse of `--disable-features`; an unselected feature is never imported. |
+| `--global-engine-dir DIR`   | Path to the external `global_wagon_app` engine. Overrides `$GLOBAL_WAGON_APP_DIR`. |
+| `--stage1-engine NAME`      | `global_wagon_app` (default) or `wagon_count` (rollback). |
 | `--skip-upload`             | Don't upload PDF/JSON, don't archive to S3.           |
 | `--skip-email`              | Don't send the combined email.                        |
 | `--poll-interval N`         | Continuous-mode S3 poll interval (seconds).           |

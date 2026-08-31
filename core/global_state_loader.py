@@ -58,9 +58,42 @@ class GlobalWagon:
     leading_gap: Optional[Dict[str, Any]] = None
     trailing_gap: Optional[Dict[str, Any]] = None
 
+    # ---- additive: explicit aligned per-camera windows --------------------
+    # `{camera_id: {"start_frame", "end_frame", "status", ...}}` in each
+    # camera's OWN original-video frame space, as resolved by a counting engine
+    # that aligns cameras with a scale and a direction rather than a single
+    # shared clock.  Empty for a state written by an engine that does not
+    # produce them, in which case consumers fall back to the master-time
+    # projection exactly as before.
+    #
+    # compare=False keeps GlobalWagon hashable (a frozen dataclass derives
+    # __hash__ from its comparable fields, and a dict is unhashable) and keeps
+    # equality meaning "same wagon", not "same projection metadata".
+    camera_frame_ranges: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict, compare=False, repr=False)
+
     @property
     def duration(self) -> float:
         return max(0.0, self.end_time - self.start_time)
+
+    def local_range(self, camera_id: str) -> Optional[Tuple[int, int]]:
+        """Inclusive `(start_frame, end_frame)` for one camera, or None.
+
+        None means "this engine gave no explicit window for this camera" --
+        either it emits none at all, or it could not resolve this wagon on this
+        camera.  The caller decides what to do; this module never guesses.
+        """
+        entry = (self.camera_frame_ranges or {}).get(camera_id)
+        if not isinstance(entry, Mapping):
+            return None
+        start, end = entry.get("start_frame"), entry.get("end_frame")
+        if start is None or end is None:
+            return None
+        try:
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
+            return None
+        return (min(start, end), max(start, end))
 
 
 @dataclass
@@ -167,6 +200,19 @@ class GlobalTrainState:
         """Offset for one camera; 0.0 when unresolved/absent."""
         return self.camera_time_offsets().get(camera_id, 0.0)
 
+    # ------------------------------------------------------------------
+    # Aligned per-camera windows
+    # ------------------------------------------------------------------
+
+    @property
+    def uses_camera_frame_ranges(self) -> bool:
+        """True when at least one wagon carries an explicit aligned window.
+
+        Lets Stage 2 report which projection it used without having to know
+        which counting engine produced the state.
+        """
+        return any(w.camera_frame_ranges for w in self.wagons)
+
 
 # -----------------------------------------------------------------------------
 # Roster immutability guard
@@ -269,6 +315,7 @@ def parse_global_train_state(doc: Dict[str, Any]) -> GlobalTrainState:
             split_from_global_id=w.get("split_from_global_id"),
             leading_gap=w.get("leading_gap"),
             trailing_gap=w.get("trailing_gap"),
+            camera_frame_ranges=dict(w.get("camera_frame_ranges") or {}),
         ))
 
     invariants = dict(doc.get("invariant_checks") or {})

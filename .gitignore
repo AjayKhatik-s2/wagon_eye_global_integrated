@@ -19,6 +19,23 @@ batch_outputs/
 # competing counter. Provenance tests skip cleanly when it is absent.
 wagon_count - Copy_correct_count/
 
+# --- Machine-specific deployment config ----------------------------------
+# Written by scripts/setup_ec2.sh; holds absolute paths for ONE box.
+wagoneye.env
+*.env
+!*.env.example
+
+# --- Runtime logs / reports ----------------------------------------------
+*.log
+*.pdf
+wagon_cache/
+wagon_states/
+
+# --- The external counting engine ----------------------------------------
+# It is a SEPARATE project and must never be vendored or nested here.
+global_wagon_app/
+global_count_ec2/
+
 # --- Python --------------------------------------------------------------
 __pycache__/
 *.py[cod]

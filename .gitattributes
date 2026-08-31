@@ -1,0 +1,15 @@
+# Line endings are deployment-critical: a .sh committed with CRLF fails on
+# Linux with "bad interpreter: /usr/bin/env bash^M". Normalize to LF in the
+# repository regardless of the platform a commit is made from.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.ini  text eol=lf
+
+# Never diff or line-ending-mangle binaries.
+*.pt   binary
+*.mp4  binary
+*.pdf  binary
+*.jpeg binary
+*.jpg  binary

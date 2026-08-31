@@ -9,8 +9,12 @@ Run modes:
 
 Pipeline (per batch):
     Stage 1  reconstruction.runner.run     -> GlobalTrainState
+             (default engine: the validated external global_wagon_app)
     Stage 2  materializer.wagon_cache_builder.build  -> wagon_cache/
-    Stage 3  features.{door,load,damage,ocr}.processor.run (parallel)
+    Stage 3  the ENABLED features only (--features / --disable-features).
+             Processors are imported lazily, so a feature that will not run
+             never imports its module and never loads its model -- notably
+             OCR, whose import chain pulls in EasyOCR.
     Stage 4  fusion.wagon_state_builder.build
     Stage 5  reporting.combined_train_report.build
     Stage 6  delivery.{s3_upload, notification}
@@ -22,6 +26,7 @@ failed_no_global_state and abandoned.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -30,7 +35,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Make sibling packages importable when running this file directly.
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,21 +60,106 @@ from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
 from reconstruction import runner as reconstruction_runner
 from materializer import wagon_cache_builder
-from features.door   import processor as door_proc
-from features.load   import processor as load_proc
-from features.damage import processor as damage_proc
-from features.ocr    import processor as ocr_proc
 from fusion import wagon_state_builder
 from reporting import combined_train_report, camera_reports
 from rendering import feature_overlay_renderer
 from delivery import s3_upload, notification
 
 
+# -----------------------------------------------------------------------------
+# Stage-3 processor registry (lazy)
+# -----------------------------------------------------------------------------
+# Module PATHS, not modules.  A processor is imported only when it is actually
+# going to run, so a disabled feature costs nothing: no module import, no model
+# load.  This matters most for OCR, whose import chain reaches EasyOCR.
+# The keys are exactly core.feature_config.FEATURE_KEYS.
+
+FEATURE_MODULES: Dict[str, str] = {
+    "door":   "features.door.processor",
+    "ocr":    "features.ocr.processor",
+    "load":   "features.load.processor",
+    "damage": "features.damage.processor",
+}
+FEATURES_ALL_KEYWORD = "all"
+
+
+def load_feature_runner(key: str):
+    """Import one feature processor on demand and return its `run` callable."""
+    if key not in FEATURE_MODULES:
+        raise KeyError("unknown feature %r" % key)
+    return importlib.import_module(FEATURE_MODULES[key]).run
+
+
+def parse_features(spec: Optional[str]) -> Tuple[str, ...]:
+    """Turn a --features value into the ordered tuple of features to RUN.
+
+        "all"                -> every registered feature
+        "door,load,damage"   -> exactly those three
+
+    Names are case-insensitive and de-duplicated; FEATURE_KEYS order is
+    preserved regardless of the order given.  Raises ValueError on an unknown
+    or empty selection.
+    """
+    if spec is None:
+        return tuple(FEATURE_KEYS)
+    text = str(spec).strip()
+    valid = ", ".join(FEATURE_KEYS)
+    if not text:
+        raise ValueError(
+            "--features may not be empty; use '%s' or a comma-separated "
+            "subset of: %s" % (FEATURES_ALL_KEYWORD, valid))
+    if text.lower() == FEATURES_ALL_KEYWORD:
+        return tuple(FEATURE_KEYS)
+
+    requested = [part.strip().lower()
+                 for part in text.replace(";", ",").split(",")]
+    requested = [part for part in requested if part]
+    if not requested:
+        raise ValueError(
+            "--features may not be empty; use '%s' or a comma-separated "
+            "subset of: %s" % (FEATURES_ALL_KEYWORD, valid))
+    unknown = sorted({part for part in requested if part not in FEATURE_MODULES})
+    if unknown:
+        raise ValueError(
+            "unknown feature(s): %s. Valid features are: %s (or '%s')"
+            % (", ".join(unknown), valid, FEATURES_ALL_KEYWORD))
+    return tuple(key for key in FEATURE_KEYS if key in set(requested))
+
+
+def feature_config_from_selection(selected: Sequence[str]) -> FeatureConfig:
+    """A FeatureConfig with everything OUTSIDE `selected` turned off.
+
+    --features is a selection front-end over the existing enable/disable
+    machinery, so a skipped feature follows exactly the same downstream path it
+    always has: a DISABLED_BY_USER sentinel per wagon, and the reports saying
+    so.  No new downstream behaviour is introduced.
+    """
+    chosen = set(selected)
+    return FeatureConfig.from_disabled(
+        [key for key in FEATURE_KEYS if key not in chosen])
+
+
 # Default per-batch paths (relative to a workspace root)
 DEFAULT_WORKSPACE_PARENT = os.path.join(_REPO_ROOT, "batch_outputs")
 DEFAULT_MODELS_DIR        = os.path.join(_REPO_ROOT, "models")
-DEFAULT_RECON_MODELS_DIR  = os.path.join(DEFAULT_MODELS_DIR, "reconstruction")
-DEFAULT_FEAT_MODELS_DIR   = os.path.join(DEFAULT_MODELS_DIR, "features")
+
+
+def _dir_default(env_var: str, fallback: str) -> str:
+    """Environment override -> path, else the in-repo default.
+
+    Weights are never committed and usually live outside the checkout, so a
+    deployment can point at them once (scripts/setup_ec2.sh writes these into
+    wagoneye.env) instead of on every command line.  `~` is expanded here
+    because an env file or a systemd unit will not do it.
+    """
+    value = (os.environ.get(env_var) or "").strip()
+    return os.path.abspath(os.path.expanduser(value)) if value else fallback
+
+
+DEFAULT_RECON_MODELS_DIR = _dir_default(
+    "WAGONEYE_RECON_MODELS_DIR", os.path.join(DEFAULT_MODELS_DIR, "reconstruction"))
+DEFAULT_FEAT_MODELS_DIR = _dir_default(
+    "WAGONEYE_FEAT_MODELS_DIR", os.path.join(DEFAULT_MODELS_DIR, "features"))
 
 
 # -----------------------------------------------------------------------------
@@ -189,6 +279,8 @@ def process_batch(
     damage_sample_stride: int = 3,
     load_inference_mode: str = "sampled",
     load_sample_stride: int = 2,
+    global_engine_dir: Optional[str] = None,
+    stage1_engine: Optional[str] = None,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -240,6 +332,8 @@ def process_batch(
                 reconstruction_models_dir=recon_models_dir,
                 output_dir=stage0_root,
                 repo_root=_REPO_ROOT,
+                engine=stage1_engine,
+                engine_dir=global_engine_dir,
                 verbose=verbose,
             )
         out.state = recon.state
@@ -344,19 +438,19 @@ def process_batch(
     with timer.stage("stage3_total"):
         # 1) Load first (deterministic input for damage's load-aware filter).
         if feature_config.is_enabled("load"):
-            out.feature_summary["load"] = _run_feature("load", load_proc.run)
+            out.feature_summary["load"] = _run_feature(
+                "load", load_feature_runner("load"))
         else:
             out.feature_summary["load"] = _mark_disabled("load")
 
         # 2) Then door / ocr / damage -- only the enabled ones run (in parallel).
-        all_parallel = {
-            "door":   door_proc.run,
-            "ocr":    ocr_proc.run,
-            "damage": damage_proc.run,
-        }
-        parallel_targets = {n: fn for n, fn in all_parallel.items()
-                            if feature_config.is_enabled(n)}
-        for name in all_parallel:
+        # A disabled processor is never imported, so it cannot load a model or
+        # initialize EasyOCR just by being listed here.
+        parallel_keys = ("door", "ocr", "damage")
+        parallel_targets = {name: load_feature_runner(name)
+                            for name in parallel_keys
+                            if feature_config.is_enabled(name)}
+        for name in parallel_keys:
             if name not in parallel_targets:
                 out.feature_summary[name] = _mark_disabled(name)
 
@@ -682,6 +776,8 @@ def run_auto(*args, **kwargs):
     skip_upload      = kwargs.get("skip_upload", False)
     skip_email       = kwargs.get("skip_email", False)
     feature_config   = kwargs.get("feature_config") or FeatureConfig.all_on()
+    global_engine_dir = kwargs.get("global_engine_dir")
+    stage1_engine     = kwargs.get("stage1_engine")
 
     start = datetime.now(timezone.utc)
     processed = load_batch_state(s3, state_loc)
@@ -713,6 +809,8 @@ def run_auto(*args, **kwargs):
                 recon_models_dir=recon_models_dir, feat_models_dir=feat_models_dir,
                 s3_client=s3, skip_upload=skip_upload, skip_email=skip_email,
                 feature_config=feature_config,
+                global_engine_dir=global_engine_dir,
+                stage1_engine=stage1_engine,
                 **(kwargs.get("inference_opts") or {}),
             )
             processed[batch.batch_key] = outcome.final_status
@@ -743,6 +841,8 @@ def run_local(
     feat_models_dir: str,
     feature_config: Optional[FeatureConfig] = None,
     inference_opts: Optional[Dict[str, Any]] = None,
+    global_engine_dir: Optional[str] = None,
+    stage1_engine: Optional[str] = None,
 ) -> int:
     if not os.path.isdir(local_inputs):
         print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
@@ -770,6 +870,8 @@ def run_local(
         s3_client=_NoopS3(),
         skip_upload=True, skip_email=True,
         feature_config=feature_config or FeatureConfig.all_on(),
+        global_engine_dir=global_engine_dir,
+        stage1_engine=stage1_engine,
         **(inference_opts or {}),
     )
     if outcome.report_pdf_path:
@@ -812,6 +914,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--disable-features", default="",
                    help="comma-separated feature keys to turn OFF "
                         "(door,ocr,load,damage); skips the interactive prompt")
+    p.add_argument(
+        "--features", default=None, metavar="LIST",
+        help=("Stage-3 features to RUN: '%s' or a comma-separated subset of "
+              "%s.  The inverse of --disable-features (pass one or the other, "
+              "not both).  A feature left out is never imported, so its model "
+              "is never loaded -- e.g. --features door,load,damage skips OCR "
+              "entirely and EasyOCR is never initialized.  Fusion and the "
+              "reports mark it DISABLED, exactly as --disable-features does."
+              % (FEATURES_ALL_KEYWORD, ",".join(FEATURE_KEYS))))
+    p.add_argument(
+        "--global-engine-dir", default=None, metavar="DIR",
+        help=("Path to the validated external global_wagon_app counting engine. "
+              "Overrides $GLOBAL_WAGON_APP_DIR.  May point at the package "
+              "itself or at the checkout containing it.  If omitted, the "
+              "engine is looked for beside this repo and in $HOME."))
+    p.add_argument(
+        "--stage1-engine", default=None,
+        choices=(reconstruction_runner.ENGINE_GLOBAL_APP,
+                 reconstruction_runner.ENGINE_WAGON_COUNT),
+        help=("Stage-1 counting engine (default: %s).  Also settable with "
+              "$WAGONEYE_STAGE1_ENGINE.  The retained wagon_count subprocess "
+              "counter stays available for rollback."
+              % reconstruction_runner.ENGINE_DEFAULT))
     p.add_argument("--no-interactive",   action="store_true",
                    help="never prompt for feature config (force all-ON unless "
                         "--disable-features given)")
@@ -853,10 +978,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     # toggling is only offered for --local-only / --once / --batch foreground
     # runs, and only when stdin is a real TTY (resolve_feature_config gates it).
     interactive = (not args.no_interactive) and (not args.auto)
-    feature_config = resolve_feature_config(
-        disable_features=args.disable_features,
-        interactive=interactive,
-    )
+
+    if args.features and args.disable_features:
+        print("ERROR: pass --features OR --disable-features, not both "
+              "(they are two ways of saying the same thing).", file=sys.stderr)
+        return 2
+
+    if args.features:
+        try:
+            selected = parse_features(args.features)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+        feature_config = feature_config_from_selection(selected)
+        _print_feature_config(
+            feature_config, header="Feature Configuration (from --features):")
+    else:
+        feature_config = resolve_feature_config(
+            disable_features=args.disable_features,
+            interactive=interactive,
+        )
+    print(f"[ORCH] Stage-3 features to run: "
+          f"{', '.join(feature_config.enabled_keys()) or '(none)'}")
 
     # Stage-3 inference mode.  --legacy-inference is a shorthand that forces
     # BOTH detectors back to the original every-frame tracker path.
@@ -884,6 +1027,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             feat_models_dir=args.feat_models_dir,
             feature_config=feature_config,
             inference_opts=inference_opts,
+            global_engine_dir=args.global_engine_dir,
+            stage1_engine=args.stage1_engine,
         )
 
     if not (args.auto or args.once or args.batch):
@@ -903,6 +1048,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_email=args.skip_email,
         feature_config=feature_config,
         inference_opts=inference_opts,
+        global_engine_dir=args.global_engine_dir,
+        stage1_engine=args.stage1_engine,
     )
 
 

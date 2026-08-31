@@ -77,17 +77,39 @@ class CacheBuildResult:
 
 def _wagon_local_range(
     wagon: GlobalWagon, local_fps: float, local_total_frames: int,
-    time_offset: float = 0.0,
+    time_offset: float = 0.0, camera_id: Optional[str] = None,
 ) -> Tuple[int, int]:
-    """Convert a GlobalWagon's master-clock window to inclusive [start, end]
-    frame indices in the camera's local timeline.
+    """Inclusive `[start, end]` local frame indices for one wagon on one camera.
 
-    `time_offset` is the camera's clock delta (`t_global = t_local + delta`).
+    Two sources, in order:
+
+    1. `wagon.camera_frame_ranges[camera_id]` -- the window a counting engine
+       ALREADY aligned for this camera.  Preferred whenever present, because an
+       engine that resolves a per-camera scale and direction (including a fully
+       reversed timeline) knows something no single clock delta can express.
+    2. the master-time projection `(start_time - delta) * local_fps` -- the
+       historical path, still exact for an engine that emits a shared clock
+       with per-camera offsets.
+
     Returns `(0, -1)` -- an empty range -- when the wagon does not overlap this
     camera's footage at all, so the caller writes no frames for it instead of
     clamping onto a frame that shows a different wagon.
     """
-    if local_fps <= 0 or local_total_frames <= 0:
+    if local_total_frames <= 0:
+        return (0, -1)
+
+    explicit = wagon.local_range(camera_id) if camera_id is not None else None
+    if explicit is not None:
+        sf, ef = explicit
+        # Clip, but never fabricate: a window entirely outside this camera's
+        # footage still contributes nothing.
+        if ef < 0 or sf > local_total_frames - 1:
+            return (0, -1)
+        sf = max(0, min(local_total_frames - 1, sf))
+        ef = max(0, min(local_total_frames - 1, ef))
+        return (sf, max(sf, ef))
+
+    if local_fps <= 0:
         return (0, -1)
     sf = int(round((wagon.start_time - time_offset) * local_fps))
     ef = int(round((wagon.end_time   - time_offset) * local_fps)) - 1
@@ -139,7 +161,7 @@ def _extract_one_camera(
     out_of_range: List[str] = []
     for gw in state.wagons:
         sf, ef = _wagon_local_range(gw, local_fps, total_meta or 10**7,
-                                    time_offset)
+                                    time_offset, camera_id=camera_id)
         if ef < sf:
             # Not visible on this camera.  The wagon keeps its global id; this
             # camera just contributes no evidence for it.
@@ -178,8 +200,14 @@ def _extract_one_camera(
 
     if verbose:
         offset_note = f"  offset={time_offset:+.2f}s" if time_offset else ""
+        explicit_n = sum(1 for gw in state.wagons
+                         if gw.local_range(camera_id) is not None)
+        source = ("aligned camera_frame_ranges" if explicit_n
+                  else "master-time projection")
         print(f"[STAGE2/{camera_id}] done in {elapsed:.1f}s  "
               f"frames_written={written}{offset_note}")
+        print(f"  [STAGE2/{camera_id}] frame windows: {source} "
+              f"({explicit_n}/{len(state.wagons)} wagons explicit)")
         if out_of_range:
             print(f"  [STAGE2/{camera_id}] {len(out_of_range)} wagon(s) outside "
                   f"this camera's footage -> no frames cached "

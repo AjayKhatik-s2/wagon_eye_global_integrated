@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import constants as C
 
@@ -109,7 +109,13 @@ def build_local_batch(
 # -----------------------------------------------------------------------------
 
 def scan_local_video_dir(local_dir: str) -> Dict[str, str]:
-    """Find one video per camera by camera-name substring (case-insensitive)."""
+    """Find one video per camera by filename substring (case-insensitive).
+
+    Each camera accepts several spellings (`C.CAMERA_FILENAME_ALIASES`) because
+    the CCTV exporter names the top cameras RIGHT_TOP / LEFT_TOP rather than
+    RIGHT_UP_TOP / LEFT_UP_TOP.  Aliases are tried LONGEST FIRST, so
+    RIGHT_UP_TOP is never captured by the shorter, ambiguous RIGHT_UP.
+    """
     import glob
 
     candidates: List[str] = []
@@ -117,12 +123,21 @@ def scan_local_video_dir(local_dir: str) -> Dict[str, str]:
         candidates.extend(glob.glob(os.path.join(local_dir, "**", ext), recursive=True))
     candidates = sorted(set(candidates))
 
+    # (alias, camera) pairs, longest alias first; ties keep ALL_CAMERAS order.
+    pairs: List[Tuple[str, str]] = [
+        (alias, cam)
+        for cam in C.ALL_CAMERAS
+        for alias in C.CAMERA_FILENAME_ALIASES.get(cam, (cam,))
+    ]
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+
     found: Dict[str, str] = {}
-    # Longest camera name first so RIGHT_UP_TOP wins over RIGHT_UP
-    for cam in sorted(C.ALL_CAMERAS, key=len, reverse=True):
-        cam_l = cam.lower()
+    for alias, cam in pairs:
+        if cam in found:
+            continue
+        alias_l = alias.lower()
         for path in candidates:
-            if cam_l in os.path.basename(path).lower() and path not in found.values():
+            if alias_l in os.path.basename(path).lower() and path not in found.values():
                 found[cam] = path
                 break
     return found

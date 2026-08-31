@@ -30,6 +30,18 @@ CAMERA_FOLDER = {
 # Reverse lookup
 CAMERA_FROM_FOLDER = {v: k for k, v in CAMERA_FOLDER.items()}
 
+# Filename spellings accepted when scanning an input folder for the 4 videos.
+# The CCTV exporter writes the two TOP cameras as RIGHT_TOP / LEFT_TOP, so both
+# that spelling and the canonical one must resolve to the same camera.
+# scan_local_video_dir matches the LONGEST alias first, so RIGHT_UP_TOP is
+# never captured by the shorter RIGHT_UP.
+CAMERA_FILENAME_ALIASES = {
+    CAMERA_RIGHT_UP:     (CAMERA_RIGHT_UP,),
+    CAMERA_LEFT_UP:      (CAMERA_LEFT_UP,),
+    CAMERA_RIGHT_UP_TOP: (CAMERA_RIGHT_UP_TOP, "RIGHT_TOP"),
+    CAMERA_LEFT_UP_TOP:  (CAMERA_LEFT_UP_TOP,  "LEFT_TOP"),
+}
+
 
 # -----------------------------------------------------------------------------
 # Status sentinel values
