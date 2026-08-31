@@ -14,11 +14,14 @@ that does a single Global Assembly turn the evidence into meaning.
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from core import constants as C
+from global_counting import runner as gc_runner
 
 from sequential import camera_runner, evidence as ev, global_assembly
 
@@ -38,6 +41,36 @@ class SequentialOutcome:
     @property
     def failed_cameras(self) -> List[str]:
         return [result.camera_id for result in self.cameras if not result.sealed]
+
+
+def resolve_reconstruction_models(recon_models_dir: str,
+                                  repo_root: str) -> Dict[str, str]:
+    """Resolve the five engine weights from the SUPPLIED directory, or explain.
+
+    Sequential uses exactly the same contract as Batch/Stage-1:
+    `global_counting.runner.resolve_models`, which expands the path and accepts
+    the same filename spellings. There is no Sequential-specific search and no
+    fallback that could override the CLI value.
+
+    The failure message names the flag, because a run that simply omitted
+    `--recon-models-dir` falls back to the in-repo default and would otherwise
+    look identical to a resolution bug.
+    """
+    default_dir = os.path.join(repo_root, "models", "reconstruction")
+    expanded = os.path.abspath(os.path.expanduser(
+        os.path.expandvars(recon_models_dir or "")))
+    try:
+        return gc_runner.resolve_models(expanded)
+    except gc_runner.GlobalCountingError as exc:
+        hint = ""
+        if expanded == os.path.abspath(default_dir):
+            hint = ("\n\nNOTE: this is the in-repo DEFAULT directory, which "
+                    "means no --recon-models-dir was supplied on the command "
+                    "line (and $WAGONEYE_RECON_MODELS_DIR was not set). The "
+                    "validated weights are not stored in the repository. Pass "
+                    "the directory that holds them, e.g.\n"
+                    "    --recon-models-dir ~/global_wagon_models")
+        raise camera_runner.CameraRunError(str(exc) + hint) from exc
 
 
 def camera_order(video_paths: Dict[str, str],
@@ -71,6 +104,7 @@ def run_sequential(
     order = camera_order(video_paths)
     outcome = SequentialOutcome(batch_key=batch_key, workspace=workspace)
 
+    selected = list(features)
     if verbose:
         print("=" * 78)
         print("  SEQUENTIAL  batch=%s" % batch_key)
@@ -80,15 +114,44 @@ def run_sequential(
         if absent:
             print("[SEQ] cameras absent  : %s  (each present camera is still "
                   "processed and reported independently)" % ", ".join(absent))
-        print("[SEQ] features        : %s" % ", ".join(features))
+        # Print the SELECTED set and, explicitly, what was left out -- so a run
+        # that silently defaulted to every feature is obvious in the log.
+        skipped = [name for name in camera_runner.DEFAULT_STRIDES
+                   if name not in selected]
+        print("[SEQ] features        : %s" % (", ".join(selected) or "(none)"))
+        print("[SEQ] features OFF    : %s"
+              % (", ".join(skipped) if skipped
+                 else "(none -- every feature is enabled)"))
+        if "ocr" not in selected:
+            print("[SEQ] OCR             : DISABLED (never imported, no model "
+                  "loaded)")
         print("[SEQ] strides         : door=%d damage=%d load=%d"
               % (door_stride, damage_stride, load_stride))
+        print("[SEQ] recon models    : %s"
+              % os.path.abspath(os.path.expanduser(recon_models_dir or "")))
+        print("[SEQ] feature models  : %s"
+              % os.path.abspath(os.path.expanduser(feat_models_dir or "")))
 
     if not order:
         if verbose:
             print("[SEQ] no camera videos found -- nothing to do")
         outcome.seconds = time.time() - started
         return outcome
+
+    # Resolve the five engine weights ONCE, from the supplied directory, before
+    # any video is opened: a wrong directory should fail in a second, not after
+    # the first camera has decoded.
+    try:
+        counting_models = resolve_reconstruction_models(recon_models_dir,
+                                                        repo_root)
+    except camera_runner.CameraRunError as exc:
+        print("[SEQ] cannot resolve the reconstruction models:\n%s" % exc,
+              file=sys.stderr)
+        outcome.seconds = time.time() - started
+        return outcome
+    if verbose:
+        for slot in sorted(counting_models):
+            print("[SEQ]   %-22s -> %s" % (slot, counting_models[slot]))
 
     for camera_id in order:
         try:

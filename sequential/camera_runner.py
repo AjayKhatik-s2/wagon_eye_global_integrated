@@ -105,7 +105,13 @@ def features_for_camera(camera_id: str,
 def _model_fingerprints(camera_id: str, *, recon_models_dir: str,
                         feat_models_dir: str,
                         camera_features: Sequence[str]) -> Dict[str, Any]:
-    """Fingerprints of every weight this camera's processing depends on."""
+    """Fingerprints of every weight this camera's processing depends on.
+
+    `gc_runner.resolve_models` is the SAME resolver Batch/Stage-1 uses, applied
+    to the SAME `--recon-models-dir` value. Sequential adds no search path of
+    its own, so the two modes can never disagree about which weight file a slot
+    means.
+    """
     out: Dict[str, Any] = {}
     counting = gc_runner.resolve_models(recon_models_dir)
     classification_slot = ("classification_top" if camera_id in C.TOP_CAMERAS

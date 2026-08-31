@@ -1221,6 +1221,15 @@ def test_global_count_ec2_is_not_vendored():
 # 7. Sequential runner orchestration
 # =============================================================================
 
+def _weights(tmp_path):
+    """run_sequential resolves the five engine weights before any camera."""
+    directory = tmp_path / "recon_models"
+    directory.mkdir(exist_ok=True)
+    for filenames in gc_runner.MODEL_SLOTS.values():
+        (directory / filenames[0]).write_bytes(b"w")
+    return str(directory)
+
+
 def test_camera_order_is_deterministic_and_configuration_driven():
     paths = {camera: "x" for camera in reversed(C.ALL_CAMERAS)}
     assert sequential_runner.camera_order(paths) == list(C.ALL_CAMERAS)
@@ -1247,7 +1256,7 @@ def test_runner_processes_cameras_in_order_then_assembles(monkeypatch, tmp_path)
     sequential_runner.run_sequential(
         video_paths={c: "v" for c in C.ALL_CAMERAS},
         workspace=str(tmp_path), repo_root=_REPO_ROOT,
-        recon_models_dir=str(tmp_path), feat_models_dir=str(tmp_path),
+        recon_models_dir=_weights(tmp_path), feat_models_dir=str(tmp_path),
         features=("door", "load", "damage"), batch_key="k", verbose=False)
 
     assert events == [("camera", c) for c in C.ALL_CAMERAS] + [("assembly", None)]
@@ -1269,7 +1278,7 @@ def test_a_failing_camera_does_not_stop_the_others(monkeypatch, tmp_path):
     outcome = sequential_runner.run_sequential(
         video_paths={c: "v" for c in C.ALL_CAMERAS},
         workspace=str(tmp_path), repo_root=_REPO_ROOT,
-        recon_models_dir=str(tmp_path), feat_models_dir=str(tmp_path),
+        recon_models_dir=_weights(tmp_path), feat_models_dir=str(tmp_path),
         features=("door",), batch_key="k", verbose=False)
 
     assert outcome.failed_cameras == [C.CAMERA_LEFT_UP]
@@ -1286,7 +1295,7 @@ def test_skip_assembly_stops_after_camera_reports(monkeypatch, tmp_path):
 
     outcome = sequential_runner.run_sequential(
         video_paths={C.CAMERA_RIGHT_UP: "v"}, workspace=str(tmp_path),
-        repo_root=_REPO_ROOT, recon_models_dir=str(tmp_path),
+        repo_root=_REPO_ROOT, recon_models_dir=_weights(tmp_path),
         feat_models_dir=str(tmp_path), features=("door",), batch_key="k",
         skip_assembly=True, verbose=False)
     assert called == []
