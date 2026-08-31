@@ -37,6 +37,7 @@ import contextlib
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core import constants as C
@@ -237,6 +238,19 @@ def resolve_models(models_dir: str) -> Dict[str, str]:
             "(side, top) and three gap models (right, left, top)."
             % (models_dir, "\n  ".join(missing)))
     return resolved
+
+
+def _as_paths(mapping: Dict[str, Any]) -> Dict[str, Path]:
+    """Every value as a `pathlib.Path`.
+
+    The engine calls `.stat()` directly on the values handed to
+    `load_all_models()`.  Its classification loader happens to re-wrap with
+    `Path()` first, so a plain `str` survives there and then fails on the gap
+    models -- a mismatch that only surfaces after both classification models
+    have already loaded.  Coercing both dictionaries at the boundary makes the
+    type guaranteed regardless of how the caller assembled them.
+    """
+    return {key: Path(value) for key, value in mapping.items()}
 
 
 # -----------------------------------------------------------------------------
@@ -530,14 +544,15 @@ def run(
         import io_paths
         video_arguments = {CAMERA_ID_TO_KEY[cam]: path
                            for cam, path in video_paths.items()}
-        io_paths.resolve_inputs(video_arguments, models)
+        # Use the dictionaries resolve_inputs RETURNS -- exactly what the
+        # engine's own CLI passes on to load_all_models.  Re-deriving them from
+        # our own string mapping skipped the engine's Path conversion.
+        resolved = io_paths.resolve_inputs(video_arguments, models)
         output_paths = io_paths.prepare_output_dirs(engine_output_dir)
 
         from models import build_class_maps, load_all_models
-        load_all_models({k[len("classification_"):]: v for k, v in models.items()
-                         if k.startswith("classification_")},
-                        {k[len("gap_"):]: v for k, v in models.items()
-                         if k.startswith("gap_")})
+        load_all_models(_as_paths(resolved["classification"]),
+                        _as_paths(resolved["gap"]))
         build_class_maps()
 
         import camera_pipeline
