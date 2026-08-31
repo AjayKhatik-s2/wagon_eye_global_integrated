@@ -214,14 +214,34 @@ class _ClassModel(object):
         return out
 
 def load_all_models(classification_paths, gap_paths):
+    """Mirrors the engine, INCLUDING its all-or-nothing validation.
+
+    The real loader checks the WHOLE camera mapping, not the camera in hand, so
+    the stub must too -- otherwise this suite would pass while production
+    raised "Classification model(s) required by the camera mapping are not
+    loaded: ['side']", which is exactly what happened on EC2.
+    """
+    from camera_map import CAMERA_CLASSIFICATION_MODEL, CAMERA_GAP_MODEL
+
     CLASSIFICATION_MODELS.clear(); GAP_MODELS.clear()
     for key, path in classification_paths.items():
         CLASSIFICATION_MODELS[key] = {"model": _ClassModel(), "imgsz": 224,
                                       "half": False, "task": "classify",
                                       "path": path}
+    absent = [k for k in sorted(set(CAMERA_CLASSIFICATION_MODEL.values()))
+              if k not in CLASSIFICATION_MODELS]
+    if absent:
+        raise RuntimeError("Classification model(s) required by the camera "
+                           "mapping are not loaded: %%s" %% absent)
+
     for key, path in gap_paths.items():
         GAP_MODELS[key] = {"model": object(), "path": path, "task": "detect",
                            "names": {0: "gap"}}
+    absent = [k for k in sorted(set(CAMERA_GAP_MODEL.values()))
+              if k not in GAP_MODELS]
+    if absent:
+        raise RuntimeError("Gap model(s) required by the camera mapping are "
+                           "not loaded: %%s" %% absent)
     return CLASSIFICATION_MODELS, GAP_MODELS
 
 def build_class_maps():

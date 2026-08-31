@@ -72,8 +72,45 @@ FEATURE_MODEL_FILES = {
 }
 
 
+# How this repository's model SLOT names map onto the keys the ENGINE's camera
+# mapping uses. The engine keys classification models by "side"/"top" and gap
+# models by "right"/"left"/"top" -- never by camera id -- and
+# `camera_map.CAMERA_CLASSIFICATION_MODEL` / `CAMERA_GAP_MODEL` are the
+# authority for which camera needs which. Sequential reads that authority at
+# runtime rather than deriving a key from the camera id.
+ENGINE_CLASSIFICATION_KEYS = {
+    "classification_side": "side",
+    "classification_top": "top",
+}
+ENGINE_GAP_KEYS = {
+    "gap_right": "right",
+    "gap_left": "left",
+    "gap_top": "top",
+}
+
+
 class CameraRunError(RuntimeError):
     pass
+
+
+def engine_model_registries(counting_models: Dict[str, str]):
+    """The COMPLETE registries `load_all_models` requires, engine-keyed.
+
+    `load_all_models` is all-or-nothing: it raises unless EVERY key named in
+    `CAMERA_CLASSIFICATION_MODEL` and `CAMERA_GAP_MODEL` is present, no matter
+    which camera is about to run. So Sequential passes the same five weights
+    Batch passes, under the engine's own keys, converted to `pathlib.Path`
+    because the engine calls `.stat()` on the values it is handed.
+
+    Loading fewer would need a change to the frozen engine; the models are
+    released again after each camera, which is where Sequential's resource
+    saving actually comes from.
+    """
+    classification = {engine_key: counting_models[slot]
+                      for slot, engine_key in ENGINE_CLASSIFICATION_KEYS.items()}
+    gap = {engine_key: counting_models[slot]
+           for slot, engine_key in ENGINE_GAP_KEYS.items()}
+    return gc_runner._as_paths(classification), gc_runner._as_paths(gap)
 
 
 @dataclass
@@ -111,6 +148,12 @@ def _model_fingerprints(camera_id: str, *, recon_models_dir: str,
     to the SAME `--recon-models-dir` value. Sequential adds no search path of
     its own, so the two modes can never disagree about which weight file a slot
     means.
+
+    Only the weights that affect THIS camera's observations are fingerprinted --
+    its own classification and gap model, plus the feature models it runs. All
+    five are LOADED (the engine's loader demands the complete set) but the other
+    three are never used for this camera's inference, so including them would
+    invalidate a perfectly good seal whenever an unrelated weight changed.
     """
     out: Dict[str, Any] = {}
     counting = gc_runner.resolve_models(recon_models_dir)
@@ -571,21 +614,23 @@ def process_camera(
             config.apply_overrides(GENERATE_TRIM_DEBUG_VIDEO=False,
                                    GENERATE_GAP_ANNOTATED_VIDEO=False)
 
-            # Load ONLY this camera's two counting weights, so Sequential does
-            # not hold all five resident at once.
+            # This camera's own keys come from the ENGINE's mapping, not from
+            # the camera id -- that mapping is the authority for which camera
+            # needs side/top classification and which gap model it uses.
             camera_key = gc_runner.CAMERA_ID_TO_KEY[camera_id]
             classification_key = camera_map.CAMERA_CLASSIFICATION_MODEL[camera_key]
             gap_key = camera_map.CAMERA_GAP_MODEL[camera_key]
-            models.load_all_models(
-                {classification_key: counting_models[
-                    "classification_top" if camera_id in C.TOP_CAMERAS
-                    else "classification_side"]},
-                {gap_key: counting_models[{
-                    C.CAMERA_RIGHT_UP: "gap_right",
-                    C.CAMERA_LEFT_UP: "gap_left",
-                    C.CAMERA_RIGHT_UP_TOP: "gap_top",
-                    C.CAMERA_LEFT_UP_TOP: "gap_top"}[camera_id]]})
+
+            # ...but load_all_models validates the WHOLE mapping, so it gets the
+            # complete five-weight registries, exactly as Batch passes them.
+            classification_paths, gap_paths = engine_model_registries(
+                counting_models)
+            models.load_all_models(classification_paths, gap_paths)
             models.build_class_maps()
+
+            if verbose:
+                print("[SEQ/%s] engine keys: classification=%r gap=%r"
+                      % (camera_id, classification_key, gap_key))
 
             from features._common import load_yolo
             for name in camera_features:
