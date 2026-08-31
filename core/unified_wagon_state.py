@@ -34,6 +34,12 @@ class UnifiedWagonState:
     left_door_confidence: float = 0.0
     right_door: str = C.NO_DATA
     right_door_confidence: float = 0.0
+    # Additive: every DISTINCT door of this wagon, each with its own state and
+    # snapshot reference. A wagon side can show two doors in different states
+    # (door 1 CLOSED, door 2 OPEN), which the two per-side fields above cannot
+    # represent. Empty for a door payload that predates the field, in which
+    # case consumers fall back to the per-side values exactly as before.
+    doors: List[Dict[str, Any]] = field(default_factory=list)
 
     # Load (top cameras)
     load_status: str = C.NO_DATA
@@ -58,7 +64,25 @@ class UnifiedWagonState:
 
     @property
     def has_open_door(self) -> bool:
+        if any(d.get("state") == C.DOOR_OPEN for d in self.doors):
+            return True
         return self.left_door == C.DOOR_OPEN or self.right_door == C.DOOR_OPEN
+
+    @property
+    def door_status(self) -> str:
+        """Wagon-level Door status: OPEN when ANY of its doors is open.
+
+        Prefers the per-door list; falls back to the two per-side fields, whose
+        picker already biases to OPEN within a side.
+        """
+        states = [str(d.get("state") or "") for d in self.doors]
+        if not states:
+            states = [self.left_door, self.right_door]
+        for wanted in (C.DOOR_DAMAGED, C.DOOR_OPEN, C.DOOR_PARTIAL,
+                       C.DOOR_CLOSED):
+            if wanted in states:
+                return wanted
+        return C.NO_DATA
 
     @property
     def has_damage(self) -> bool:

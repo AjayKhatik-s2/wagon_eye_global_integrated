@@ -1023,21 +1023,31 @@ def _build_evidence_section(*, vm, styles, evidence_root):
     images: List[Dict[str, Any]] = []
     for d in vm.left_doors:
         if d.get("local_snapshot_path"):
+            state_text = str(d.get("state", "") or "")
             images.append({
                 "path": d["local_snapshot_path"],
                 "wagon_number": d["wagon_number"],
                 "camera": "Left",
-                "issue_type": "Damage" if "damage" in str(d.get("state","")).lower() else "Open Door",
-                "label": d.get("state", ""),
+                "issue_type": ("Damage" if "damage" in state_text.lower()
+                               else "Door"),
+                "label": state_text,
+                # A wagon side can contribute more than one DISTINCT door, so
+                # the caption must name which one this snapshot shows.
+                "door_number": d.get("door_number"),
             })
     for d in vm.right_doors:
         if d.get("local_snapshot_path"):
+            state_text = str(d.get("state", "") or "")
             images.append({
                 "path": d["local_snapshot_path"],
                 "wagon_number": d["wagon_number"],
                 "camera": "Right",
-                "issue_type": "Damage" if "damage" in str(d.get("state","")).lower() else "Open Door",
-                "label": d.get("state", ""),
+                "issue_type": ("Damage" if "damage" in state_text.lower()
+                               else "Door"),
+                "label": state_text,
+                # A wagon side can contribute more than one DISTINCT door, so
+                # the caption must name which one this snapshot shows.
+                "door_number": d.get("door_number"),
             })
     for d in vm.top_doors:
         if d.get("local_snapshot_path"):
@@ -1139,6 +1149,16 @@ def _build_evidence_section(*, vm, styles, evidence_root):
                     img_info["camera"],
                     f"{img_info['camera']} Camera – {img_info['issue_type']}",
                 )
+                # Name the individual door when the wagon has more than one, so
+                # "Door 1 CLOSED" and "Door 2 OPEN" are distinguishable rather
+                # than two identically captioned snapshots.
+                door_number = img_info.get("door_number")
+                if door_number:
+                    state_text = str(img_info.get("label") or "").strip()
+                    display_label = (
+                        f"{display_label} – Door {int(door_number)}"
+                        + (f" – {_brand.format_door_status(state_text)}"
+                           if state_text else ""))
                 img = Image(img_info["path"])
                 w, h = img.drawWidth, img.drawHeight
                 if w > _brand.EVIDENCE_IMG_MAX_W:

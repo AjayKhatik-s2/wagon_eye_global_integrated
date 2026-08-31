@@ -215,6 +215,19 @@ def iter_wagon_frames(
 # YOLO calls
 # -----------------------------------------------------------------------------
 
+def _predict_kwargs(half: bool) -> Dict[str, Any]:
+    """Predict kwargs, omitting `half` unless fp16 is actually wanted.
+
+    Ultralytics deprecated the `half` argument in favour of `quantize`
+    (ultralytics/cfg/__init__.py::_handle_deprecation -> utils.deprecation_warn),
+    and warns for every call that merely MENTIONS the key -- even
+    `half=False`, which is already the library default. Omitting the default
+    is behaviour-preserving and silences the warning; a genuine fp16 request
+    is still passed through unchanged, because dropping it would change
+    inference precision.
+    """
+    return {"verbose": False, "half": True} if half else {"verbose": False}
+
 def run_detection(
     model, frame: np.ndarray,
     *, confidence: float = 0.4, half: bool = False,
@@ -225,7 +238,7 @@ def run_detection(
     """
     if model is None:
         return []
-    res = model(frame, verbose=False, half=half)[0]
+    res = model(frame, **_predict_kwargs(half))[0]
     if res.boxes is None or len(res.boxes) == 0:
         return []
 

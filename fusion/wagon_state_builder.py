@@ -100,6 +100,13 @@ def _fuse_one(
         if door.get("right_door") and door["right_door"] != C.NO_DATA:
             u.right_door = str(door["right_door"])
             u.right_door_confidence = float(door.get("right_door_confidence", 0.0) or 0.0)
+        # Additive: carry every DISTINCT door through, so the report can show
+        # door 1 CLOSED and door 2 OPEN separately instead of one state per
+        # side. Absent in a payload from before the field -> stays empty.
+        doors = door.get("doors")
+        if isinstance(doors, list) and doors:
+            u.doors = [dict(entry) for entry in doors
+                       if isinstance(entry, dict)]
 
     # ---- Load ----
     if _is_ok(load):

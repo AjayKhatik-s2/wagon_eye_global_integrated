@@ -90,6 +90,41 @@ def _door_entries(
     """
     out = {"left": [], "right": []}
 
+    # ---- multi-door path -----------------------------------------------
+    # A wagon side can show two or more DISTINCT doors in different states
+    # (door 1 CLOSED, door 2 OPEN). When the door feature reports them
+    # individually, every door of an anomalous wagon is emitted with its OWN
+    # snapshot -- including the closed ones, which is the whole point: the
+    # reader needs to see that door 1 is shut and door 2 is not.
+    if u.doors:
+        if not _brand.is_side_anomaly(u.door_status):
+            return out
+        for door in u.doors:
+            side_key = str(door.get("side") or "").lower()
+            if side_key not in out:
+                camera_id = str(door.get("camera_id") or "")
+                side_key = "left" if camera_id == C.CAMERA_LEFT_UP else "right"
+            index = int(door.get("door_index") or (len(out[side_key]) + 1))
+            # Per-door snapshot; the sampled path writes door_<n>.jpg. The
+            # tracker path takes no per-door image, so fall back to that
+            # side's best frame rather than showing nothing.
+            snap = ev.evidence_snapshot(
+                evidence_root, gw_id, "door", f"door_{index}")
+            if not snap:
+                snap = ev.evidence_snapshot(
+                    evidence_root, gw_id, "door", f"{side_key}_best")
+            out[side_key].append({
+                "wagon_number":         wagon_number,
+                "door_number":          index,
+                "state":                str(door.get("state") or ""),
+                "confidence":           float(door.get("confidence") or 0.0),
+                "local_snapshot_path":  snap,
+                "camera_id":            door.get("camera_id"),
+                "track_id":             door.get("track_id"),
+            })
+        return out
+
+    # ---- per-side path (unchanged; door payloads without `doors`) -------
     for side_key, state_val, conf in (
         ("left",  u.left_door,  u.left_door_confidence),
         ("right", u.right_door, u.right_door_confidence),
@@ -217,12 +252,23 @@ def build_legacy_view_model(
         is_non_wagon = u.classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN)
         is_loaded    = (u.load_status == C.LOAD_LOADED)
 
-        left_text  = (_brand.format_door_status(u.left_door)
-                      if u.left_door  not in (None, "", C.NO_DATA)
-                      else "NO DOOR DETECTED")
-        right_text = (_brand.format_door_status(u.right_door)
-                      if u.right_door not in (None, "", C.NO_DATA)
-                      else "NO DOOR DETECTED")
+        # When the door feature reports individual doors, name each one:
+        # "DOOR 1 CLOSED / DOOR 2 OPEN". Otherwise keep the per-side text
+        # exactly as before.
+        def _side_text(side_key: str, fallback_state: str) -> str:
+            per_door = [d for d in u.doors
+                        if str(d.get("side") or "").lower() == side_key]
+            if per_door:
+                return " / ".join(
+                    "DOOR %d %s" % (int(d.get("door_index") or i),
+                                    _brand.format_door_status(d.get("state")))
+                    for i, d in enumerate(per_door, start=1))
+            if fallback_state not in (None, "", C.NO_DATA):
+                return _brand.format_door_status(fallback_state)
+            return "NO DOOR DETECTED"
+
+        left_text  = _side_text("left",  u.left_door)
+        right_text = _side_text("right", u.right_door)
 
         # Top-camera columns: the per-camera damage_status lives in the damage
         # FEATURE JSON (wagon_states/damage/<gw>.json), NOT the evidence
@@ -268,6 +314,9 @@ def build_legacy_view_model(
             "wagon_type":          _wagon_type_for_table(u),
             "left_door":           u.left_door,
             "right_door":          u.right_door,
+            # Wagon-level: OPEN when ANY of this wagon's doors is open.
+            "door_status":         u.door_status,
+            "doors":               list(u.doors),
             "left_door_confidence":  u.left_door_confidence,
             "right_door_confidence": u.right_door_confidence,
             "load_status":         u.load_status,

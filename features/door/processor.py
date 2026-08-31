@@ -4,7 +4,7 @@ ported).
 Per wagon, for each side camera (RIGHT_UP / LEFT_UP):
 
     1. Iterate cached JPEGs in wagon_cache/<GW_n>/<camera>/.
-    2. Run YOLO door_state.pt on the raw frame (half=False -- CPU build).
+    2. Run YOLO door_state.pt on the raw frame (fp32 -- CPU build).
     3. Apply the model's own confidence gate.
     4. Feed surviving detections into the legacy DoorTracker (Kalman +
        Hungarian + per-track 30-frame quality-weighted majority vote +
@@ -14,8 +14,17 @@ Per wagon, for each side camera (RIGHT_UP / LEFT_UP):
        confidence, snapshot}.
     6. Run DoorIdentityMerger to collapse fragmented tracks of the same
        physical door (spatial + temporal + context + structural).
-    7. Pick the dominant door state per CAMERA SIDE, and persist ONE best
-       representative snapshot per side.
+    7. Pick the dominant door state per CAMERA SIDE (kept for the existing
+       left_door / right_door contract), AND emit one entry per DISTINCT
+       physical door with its own representative snapshot.
+
+A wagon side can show two or more distinct doors in different states (door 1
+CLOSED, door 2 OPEN). Steps 5-6 already establish door identity -- the tracker
+groups a door's frames into one track and DoorIdentityMerger collapses
+fragmented tracks of the same physical door; the sampled path's
+EvidenceAggregator does the same through its candidates. So the identity is not
+invented here: `doors[]` simply stops discarding it, and each door carries its
+own best frame instead of one snapshot per side.
 
 REMOVED from this path (both modules remain on disk, untouched; Door was
 their only consumer):
@@ -131,7 +140,8 @@ def _run_tracker_one_camera(
     gw_id: str,
     camera_id: str,
     ownership=None,
-) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"]]:
+) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"],
+           Dict[str, Any], List[Dict[str, Any]]]:
     """Run the full per-camera door pipeline on one wagon.
 
     Returns:
@@ -148,7 +158,7 @@ def _run_tracker_one_camera(
     paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
                               ownership=ownership)
     if not paths:
-        return [], 0, 0, 0, {}, {"tracks": [], "events": []}
+        return [], 0, 0, 0, {}, {"tracks": [], "events": []}, []
 
     # Fresh tracker per (gw, camera).  Wagons are independent in the new
     # train-state-native world, so each one resets the tracker.
@@ -236,16 +246,22 @@ def _run_tracker_one_camera(
         quality = 1.0
 
         # 2) YOLO detection on raw frame.
-        #    half=False is REQUIRED: production runs on a CPU-only torch build,
-        #    which has no native fp16 kernels.  Measured on door_state.pt with
+        #    fp32 is REQUIRED: production runs on a CPU-only torch build, which
+        #    has no native fp16 kernels.  Measured on door_state.pt with
         #    identical frames and parameters (torch 2.12.0+cpu):
         #        half=True   112,637 ms/frame   0 detections
         #        half=False       675 ms/frame  1 detection @ conf 0.93
         #    fp16 is emulated (167x slower) AND degrades the numerics enough
         #    that every box falls below threshold, so the door state silently
         #    collapsed to CLOSED/0.00 for every wagon.
+        #
+        #    fp32 is Ultralytics' DEFAULT, so it is obtained by NOT passing the
+        #    argument.  Ultralytics has since deprecated `half` in favour of
+        #    `quantize` and warns on every call that mentions the key -- even
+        #    `half=False` -- so passing it explicitly bought a warning per frame
+        #    and changed nothing.  Precision here is unchanged: still fp32.
         try:
-            results = yolo_model(frame, verbose=False, half=False)[0]
+            results = yolo_model(frame, verbose=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
@@ -356,7 +372,7 @@ def _run_tracker_one_camera(
     }
     final_states = tracker.get_final_door_states()
     if not final_states:
-        return [], used, frame_w, frame_h, cands, overlay
+        return [], used, frame_w, frame_h, cands, overlay, []
 
     # Run identity merger on the final track set (collapses fragmented IDs
     # of the same physical door).  Operates on the live + deleted track
@@ -397,7 +413,21 @@ def _run_tracker_one_camera(
             "total_hits":  int(state_dict.get("total_hits", 0)),
             "mean_center_x": mean_cx,
         })
-    return decisions, used, frame_w, frame_h, cands, overlay
+
+    # The tracker path reports each distinct door too, but takes no dedicated
+    # per-door snapshot: its evidence buckets are keyed by state, which is what
+    # this path has always persisted. Such a door falls back to its side's
+    # snapshot in the report. The sampled path -- the production default -- does
+    # provide one snapshot per door.
+    door_evidence = [
+        {"camera_id": camera_id, "track_id": d["track_id"],
+         "state": d["state"], "confidence": d["confidence"],
+         "first_frame": d["first_frame"], "last_frame": d["last_frame"],
+         "total_hits": d["total_hits"], "best_frame_idx": d["last_frame"],
+         "bbox": None, "_snapshot": None}
+        for d in decisions
+    ]
+    return decisions, used, frame_w, frame_h, cands, overlay, door_evidence
 
 
 # -----------------------------------------------------------------------------
@@ -413,7 +443,7 @@ def _run_sampled_one_camera(
     sample_stride: int = 2,
     ownership=None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"],
-           Dict[str, Any]]:
+           Dict[str, Any], List[Dict[str, Any]]]:
     """Sampled-frame Door inference -- EXPERIMENTAL, not the default path.
 
     Returns the SAME 6-tuple as `_run_tracker_one_camera`, so `run()` below is
@@ -436,7 +466,7 @@ def _run_sampled_one_camera(
     paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
                               ownership=ownership)
     if not paths:
-        return [], 0, 0, 0, {}, {"tracks": [], "events": []}
+        return [], 0, 0, 0, {}, {"tracks": [], "events": []}, []
 
     stride = max(1, int(sample_stride))
     frame_w, frame_h = 0, 0
@@ -447,6 +477,10 @@ def _run_sampled_one_camera(
 
     agg: Optional[EvidenceAggregator] = None
     trajectory: Dict[int, Dict[str, Any]] = {}
+    # Frames that carried a detection, so each distinct door can be given its
+    # OWN representative snapshot at finalize. Same approach the damage
+    # processor already uses for its per-track evidence.
+    snapshots: Dict[int, Any] = {}
 
     for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
                                        every_nth=stride, trim_stable=True,
@@ -458,7 +492,7 @@ def _run_sampled_one_camera(
         used += 1
 
         try:
-            results = yolo_model(frame, verbose=False, half=False)[0]
+            results = yolo_model(frame, verbose=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
@@ -510,9 +544,11 @@ def _run_sampled_one_camera(
             })
 
         agg.add_frame(fi, observations)
+        if observations:
+            snapshots[int(fi)] = frame
 
     if agg is None:
-        return [], used, frame_w, frame_h, cands, {"tracks": [], "events": []}
+        return [], used, frame_w, frame_h, cands, {"tracks": [], "events": []}, []
 
     result = agg.finalize()
     decisions: List[Dict[str, Any]] = []
@@ -530,8 +566,98 @@ def _run_sampled_one_camera(
             "mean_center_x": float(best.center[0]) if best else 0.0,
         })
 
+    # One evidence record per DISTINCT door. The aggregator has already
+    # collapsed every sampled observation of the same physical door into one
+    # candidate, so this is per-door, not per-frame -- no extra de-duplication
+    # is invented here.
+    door_evidence = _door_evidence_from_groups(
+        camera_id, result["accepted"], snapshots, frame_w, frame_h)
+
     overlay = {"tracks": list(trajectory.values()), "events": []}
-    return decisions, used, frame_w, frame_h, cands, overlay
+    return decisions, used, frame_w, frame_h, cands, overlay, door_evidence
+
+
+# -----------------------------------------------------------------------------
+# Per-door evidence
+# -----------------------------------------------------------------------------
+
+_SIDE_OF = {C.CAMERA_LEFT_UP: "left", C.CAMERA_RIGHT_UP: "right"}
+
+
+def _side_of(camera_id: str) -> str:
+    return _SIDE_OF.get(camera_id, str(camera_id).lower())
+
+
+def order_doors(doors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Left side first, then position across the wagon, then track id.
+
+    Deterministic so "Door 1" / "Door 2" mean the same thing between runs.
+    """
+    def key(door: Dict[str, Any]):
+        bbox = door.get("bbox") or []
+        centre = ((float(bbox[0]) + float(bbox[2])) / 2.0 if len(bbox) == 4
+                  else float(door.get("first_frame", 0) or 0))
+        side_rank = 0 if door.get("camera_id") == C.CAMERA_LEFT_UP else 1
+        return (side_rank, centre, int(door.get("track_id", 0) or 0))
+    return sorted(doors, key=key)
+
+
+def _indexed_doors(doors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach the 1-based door_index and side used by the report."""
+    out = []
+    for index, door in enumerate(doors, start=1):
+        entry = dict(door)
+        entry["door_index"] = index
+        entry["side"] = _side_of(door.get("camera_id", ""))
+        out.append(entry)
+    return out
+
+
+def wagon_door_status(doors: List[Dict[str, Any]]) -> str:
+    """The wagon's Door status: OPEN when ANY of its doors is open.
+
+    Same priority the per-side picker uses, applied across every door of the
+    wagon rather than within one camera.
+    """
+    states = [str(d.get("state") or "") for d in doors]
+    for wanted in (C.DOOR_DAMAGED, C.DOOR_OPEN, C.DOOR_PARTIAL, C.DOOR_CLOSED):
+        if wanted in states:
+            return wanted
+    return C.NO_DATA
+
+def _door_evidence_from_groups(
+    camera_id: str, groups: List[Dict[str, Any]],
+    snapshots: Dict[int, Any], frame_w: int, frame_h: int,
+) -> List[Dict[str, Any]]:
+    """One record per DISTINCT door, from the aggregator's own candidates.
+
+    The aggregator has already collapsed every sampled observation of the same
+    physical door into a single candidate, so this is per-door and not
+    per-frame: no additional de-duplication is invented, and a door seen in
+    twenty sampled frames still yields exactly one entry with one snapshot.
+    """
+    out: List[Dict[str, Any]] = []
+    for group in groups:
+        best = group.get("best")
+        frame_idx = int(getattr(best, "frame_idx", -1)) if best is not None else -1
+        raw_bbox = list(getattr(best, "bbox", ()) or ()) if best is not None else []
+        bbox = None
+        if len(raw_bbox) == 4:
+            bbox = expand_bbox([float(v) for v in raw_bbox],
+                               _DOOR_BBOX_EXPAND_FRAC, frame_w, frame_h)
+        out.append({
+            "camera_id":      camera_id,
+            "track_id":       int(group["candidate_id"]),
+            "state":          str(group["state"]),
+            "confidence":     float(group["confidence"]),
+            "first_frame":    int(group["first_frame"]),
+            "last_frame":     int(group["last_frame"]),
+            "total_hits":     int(group["frame_support"]),
+            "best_frame_idx": frame_idx,
+            "bbox":           bbox,
+            "_snapshot":      snapshots.get(frame_idx),
+        })
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -688,8 +814,15 @@ def run(
                     ownership=ownership,
                 )
 
-            l_decisions, l_used, _, _, l_cands, l_overlay = _one_camera(C.CAMERA_LEFT_UP)
-            r_decisions, r_used, _, _, r_cands, r_overlay = _one_camera(C.CAMERA_RIGHT_UP)
+            (l_decisions, l_used, _, _, l_cands, l_overlay,
+             l_doors) = _one_camera(C.CAMERA_LEFT_UP)
+            (r_decisions, r_used, _, _, r_cands, r_overlay,
+             r_doors) = _one_camera(C.CAMERA_RIGHT_UP)
+
+            # Every DISTINCT door of this wagon, both sides, in a stable
+            # order. Identity comes from the tracker / aggregator, which have
+            # already collapsed repeated observations of the same physical door.
+            all_doors = order_doors(list(l_doors) + list(r_doors))
 
             supporting: List[str] = []
             if l_used > 0: supporting.append(C.CAMERA_LEFT_UP)
@@ -763,6 +896,43 @@ def run(
                         "raw_class":  side_best.meta.get("raw_class"),
                         "quality":    side_best.meta.get("quality"),
                     }
+                # ---- one snapshot per DISTINCT door --------------------
+                # The per-side `*_best` files above are unchanged, so existing
+                # consumers keep working; `doors` is additive.  Doors are
+                # ordered by side then by position across the wagon, so
+                # "Door 1 / Door 2" is stable between runs.
+                door_meta: List[Dict[str, Any]] = []
+                for index, door in enumerate(all_doors, start=1):
+                    snap = door.get("_snapshot")
+                    entry = {
+                        "door_index":     index,
+                        "camera_id":      door["camera_id"],
+                        "side":           _side_of(door["camera_id"]),
+                        "track_id":       door["track_id"],
+                        "state":          door["state"],
+                        "confidence":     door["confidence"],
+                        "first_frame":    door["first_frame"],
+                        "last_frame":     door["last_frame"],
+                        "total_hits":     door["total_hits"],
+                        "best_frame_idx": door["best_frame_idx"],
+                        "bbox":           door.get("bbox"),
+                    }
+                    if snap is not None:
+                        full_p = os.path.join(ev_dir, f"door_{index}.jpg")
+                        crop_p = os.path.join(ev_dir, f"door_{index}_crop.jpg")
+                        annotated = draw_annotated_bbox(
+                            snap, door.get("bbox"),
+                            label=f"{door['state']} {door['confidence']:.2f}",
+                            color=(0, 255, 255),
+                        )
+                        save_jpeg(full_p, annotated)
+                        evidence_paths[f"door_{index}"] = full_p
+                        crop_img = safe_crop(snap, door.get("bbox"), pad=12)
+                        if crop_img is not None:
+                            save_jpeg(crop_p, crop_img)
+                            evidence_paths[f"door_{index}_crop"] = crop_p
+                    door_meta.append(entry)
+                meta["doors"] = door_meta
                 write_metadata(os.path.join(ev_dir, "metadata.json"), meta)
 
             # Persist the per-frame track trajectory for the Stage-4b overlay.
@@ -790,6 +960,13 @@ def run(
                 "right_door":  r_state,
                 "right_door_confidence": round(float(r_conf), 4),
                 "tracks":      l_decisions + r_decisions,
+                # Additive: one entry per DISTINCT door, each with its own
+                # snapshot. left_door / right_door above are unchanged, so
+                # existing consumers are unaffected.
+                "doors":       [{k: v for k, v in door.items()
+                                 if k != "_snapshot"}
+                                for door in _indexed_doors(all_doors)],
+                "door_status": wagon_door_status(all_doors),
                 "supporting_cameras": supporting,
                 "frame_count": l_used + r_used,
                 "frames_left":  l_used,

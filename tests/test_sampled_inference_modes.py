@@ -114,15 +114,21 @@ class TestSampledPathContract(unittest.TestCase):
     """The sampled helpers must return the SAME tuple shape as legacy, so the
     surrounding run() -- JSON, evidence, snapshots -- needs no branching."""
 
-    def test_door_sampled_returns_six_tuple_on_empty_cache(self):
+    def test_door_sampled_returns_the_same_tuple_on_empty_cache(self):
+        # Arity grew from 6 to 7 when per-door evidence was added (a wagon can
+        # show two distinct doors, each needing its own snapshot). The invariant
+        # this class exists for is unchanged and still enforced below: the
+        # sampled and legacy helpers return the SAME shape, so run() needs no
+        # branching.
         got = door_proc._run_sampled_one_camera(
             None, door_proc.TrackerConfig(), "/nonexistent", "GW_1",
             "RIGHT_UP", sample_stride=2)
-        self.assertEqual(len(got), 6)
-        decisions, used, w, h, cands, overlay = got
+        self.assertEqual(len(got), 7)
+        decisions, used, w, h, cands, overlay, doors = got
         self.assertEqual((decisions, used, w, h), ([], 0, 0, 0))
         self.assertEqual(cands, {})
         self.assertEqual(set(overlay), {"tracks", "events"})
+        self.assertEqual(doors, [])
 
     def test_damage_sampled_returns_five_tuple_on_empty_cache(self):
         got = damage_proc._run_sampled_one_camera(
