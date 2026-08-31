@@ -2,7 +2,7 @@
 
     open the video ONCE
       every frame  -> gap detector          (engine, per-frame, stateless)
-      every frame  -> classification batch  (engine model + engine class map)
+      every frame  -> classification_adapter (engine model, class map, threshold)
       stride 3     -> door detector         (side cameras)
       stride 3     -> damage detector       (top cameras)
       stride 2     -> load classifier       (top cameras)
@@ -49,7 +49,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from core import constants as C
 from global_counting import runner as gc_runner
 
-from sequential import evidence as ev
+from sequential import classification_adapter, evidence as ev
 
 # Which cameras each feature actually inspects -- exactly the Batch mapping:
 # door reads the two side cameras, damage and load read the two top cameras,
@@ -178,60 +178,15 @@ def _decode_once(
     if not capture.isOpened():
         raise CameraRunError("cv2.VideoCapture could not open %s" % video_path)
 
-    batch_frames: List[Any] = []
-    batch_ids: List[int] = []
     frame_limit = int(getattr(config, "MAX_FRAMES_TO_PROCESS", 0) or 0)
 
-    def _flush_classification() -> None:
-        """Classify one batch.
-
-        Mirrors the engine's own `_classify_batch` closure inside
-        `classification.classify_video_frames`, which is not importable on its
-        own. It uses the engine's model_info, the engine's class map and the
-        engine's confidence threshold, so the per-frame verdict is the engine's
-        -- only the frame SOURCE differs (our decode loop rather than a second
-        VideoCapture). `tests/test_sequential_architecture.py` pins the record
-        shape, and the opt-in parity test compares both paths on a real video.
-        """
-        if not batch_frames:
-            return
-        # `half` is deprecated in Ultralytics (-> `quantize`) and warns for
-        # every call that mentions it, including half=False, which is the
-        # library default. `_predict_kwargs` omits it unless fp16 is genuinely
-        # requested, so precision is unchanged and no warning is emitted from
-        # our code. See tests/test_multi_door_reporting.py for the provenance.
-        predict_kwargs = dict(_predict_kwargs(bool(class_info["half"])),
-                              imgsz=class_info["imgsz"],
-                              device=engine["DEVICE_YOLO"])
-        try:
-            results = class_info["model"].predict(batch_frames, **predict_kwargs)
-        except Exception:
-            results = []
-            for one in batch_frames:
-                results.extend(
-                    class_info["model"].predict(one, **predict_kwargs))
-        threshold = float(config.CLASSIFICATION_CONFIDENCE_THRESHOLD)
-        for frame_id, result in zip(batch_ids, results):
-            probs = getattr(result, "probs", None)
-            if probs is None:
-                raise CameraRunError(
-                    "the classification model returned no 'probs'; a YOLO "
-                    "task='classify' checkpoint is required (got task=%r)"
-                    % class_info.get("task"))
-            class_id = int(probs.top1)
-            confidence = float(probs.top1conf)
-            is_wagon_class = bool(class_map["is_wagon"].get(class_id, False))
-            out.classification.append({
-                "frame_id": int(frame_id),
-                "timestamp_seconds": round(float(frame_id) / fps, 4),
-                "predicted_class": class_map["raw"].get(class_id, str(class_id)),
-                "normalized_class": class_map["normalized"].get(class_id, ""),
-                "confidence": round(confidence, 4),
-                "is_wagon_class": is_wagon_class,
-                "is_wagon": bool(is_wagon_class and confidence >= threshold),
-            })
-        batch_frames.clear()
-        batch_ids.clear()
+    # Classification goes through the ONE isolated adapter, which takes its
+    # model_info, class map, threshold, batch size and device from the engine.
+    # See sequential/classification_adapter.py for exactly what is mirrored and
+    # for the contract test that detects engine drift.
+    classifier = classification_adapter.from_engine(
+        engine=engine, classification_key=classification_key, fps=fps,
+        predict_kwargs_factory=_predict_kwargs)
 
     frame_index = 0
     try:
@@ -242,11 +197,8 @@ def _decode_once(
 
             timestamp = frame_index / fps
 
-            # ---- classification: batched, every frame -------------------
-            batch_frames.append(frame)
-            batch_ids.append(frame_index)
-            if len(batch_frames) >= int(config.BATCH_SIZE):
-                _flush_classification()
+            # ---- classification: every frame, batched by the adapter ----
+            classifier.add(frame, frame_index)
 
             # ---- GAP: EVERY decoded frame ------------------------------
             raw, valid = gap_detection.detect_gaps_in_frame(
@@ -271,29 +223,73 @@ def _decode_once(
                           % (camera_id, frame_limit))
                 break
     finally:
-        _flush_classification()
         capture.release()               # the ONE capture, always closed
 
+    out.classification = classifier.finish()
     out.decoded_frames = frame_index
     return out
 
 
+def door_confidence_floor() -> float:
+    """Batch's Door gate, read from Batch's own config object.
+
+    `features/door/processor.py` computes
+    `min_conf = float(tracker_config.closed_confidence_threshold)` and keeps
+    only detections at or above it. Reading the same attribute here means there
+    is ONE threshold, not a copy that can drift.
+    """
+    from features.door.processor import TrackerConfig
+    return float(TrackerConfig().closed_confidence_threshold)
+
+
+def damage_confidence_floor() -> float:
+    """Batch's Damage gate: the default `confidence` of its `run()`."""
+    return float(C.CONF_DAMAGE)
+
+
+def _yolo_arrays(model, frame):
+    """Raw YOLO output as the (boxes, confs, cls_ids, names) Batch filters on.
+
+    Batch calls the model and then gates the ARRAYS, so Sequential does the
+    same instead of going through a dict-returning helper -- that is what makes
+    the surviving detection set identical.
+    """
+    import numpy as np
+
+    try:
+        result = model(frame, verbose=False)[0]
+    except Exception:
+        return None
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return None
+    return (boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy(),
+            boxes.cls.cpu().numpy().astype(int),
+            getattr(model, "names", {}) or {})
+
+
 def _observe(feature: str, model, frame, frame_index: int, timestamp: float,
              width: int, height: int) -> List[ev.FeatureObservation]:
-    """Raw detections for one feature on one frame -- no aggregation.
+    """Detections for one feature on one frame, gated EXACTLY as Batch gates.
 
-    The RAW model class name is stored, not a canonical verdict, so the
-    existing feature-specific mapping and aggregation run exactly once, later,
-    in Global Assembly.
+    The gate is a detector-level validity filter (confidence floor, skip
+    classes, area ratio, edge-zone suppression) -- a property of the frame, not
+    of any wagon -- so it belongs here, where the frame is, and it must be the
+    same filter Batch applies or the two modes could not agree. Door and Damage
+    therefore call Batch's OWN threshold and Batch's OWN
+    `_filter_detections_for_top`; nothing is reimplemented.
+
+    What is NOT decided here is which wagon an observation belongs to, and what
+    the wagon's verdict is. That is Global Assembly's job.
     """
     from core.frame_quality import detection_quality, snapshot_score
-    from features._common import run_classification, run_detection
 
     if model is None:
         return []
 
     if feature == "load":
-        # Load is a classifier: one observation per sampled frame.
+        # Load has no detection gate in Batch: every sampled frame votes.
+        from features._common import run_classification
         raw_class, confidence = run_classification(model, frame)
         if not raw_class:
             return []
@@ -301,17 +297,35 @@ def _observe(feature: str, model, frame, frame_index: int, timestamp: float,
             feature="load", frame_idx=frame_index, timestamp=timestamp,
             state="", confidence=float(confidence), raw_class=str(raw_class))]
 
-    detections = run_detection(model, frame, confidence=0.0)
+    arrays = _yolo_arrays(model, frame)
+    if arrays is None:
+        return []
+    boxes, confs, cls_ids, names = arrays
+
+    if feature == "door":
+        # features/door/processor.py: keep = confs >= min_conf
+        floor = door_confidence_floor()
+        keep = confs >= floor
+        boxes, confs, cls_ids = boxes[keep], confs[keep], cls_ids[keep]
+    elif feature == "damage":
+        # features/damage/processor.py: the SAME pure filter, same floor.
+        from features.damage.processor import _filter_detections_for_top
+        boxes, confs, cls_ids = _filter_detections_for_top(
+            boxes, confs, cls_ids, names, width, height,
+            damage_confidence_floor())
+
     out: List[ev.FeatureObservation] = []
-    for detection in detections:
-        bbox = [float(v) for v in detection["bbox"]]
-        quality = detection_quality(frame, bbox)
+    for bbox, confidence, class_id in zip(boxes, confs, cls_ids):
+        bbox_list = [float(bbox[0]), float(bbox[1]),
+                     float(bbox[2]), float(bbox[3])]
+        raw_class = str(names.get(int(class_id), "unknown")).lower()
+        quality = detection_quality(frame, bbox_list)
         out.append(ev.FeatureObservation(
             feature=feature, frame_idx=frame_index, timestamp=timestamp,
-            state="", confidence=float(detection["confidence"]),
-            bbox=bbox, raw_class=str(detection["class_name"]),
-            score=float(snapshot_score(bbox, float(detection["confidence"]),
-                                       quality, width, height)),
+            state="", confidence=float(confidence), bbox=bbox_list,
+            raw_class=raw_class,
+            score=float(snapshot_score(bbox_list, float(confidence), quality,
+                                       width, height)),
             extra={"quality": round(float(quality), 4)}))
     return out
 
@@ -420,6 +434,8 @@ def _replay_gaps(engine, camera_id: str, decoded: _DecodeOutput,
             max_confidence=float(record.get("max_confidence", 0.0) or 0.0),
             average_confidence=float(record.get("average_confidence", 0.0) or 0.0),
             frame_count=int(record.get("frame_count", 0) or 0),
+            normalized_duration=float(
+                record.get("normalized_duration", 0.0) or 0.0),
         ))
 
     diagnostics = {
@@ -488,10 +504,22 @@ def process_camera(
         feat_models_dir=feat_models_dir, camera_features=camera_features)
     config_digest = ev.config_fingerprint(
         features=camera_features, door_stride=door_stride,
-        damage_stride=damage_stride, load_stride=load_stride)
+        damage_stride=damage_stride, load_stride=load_stride,
+        extra={"gates": {
+            "door": door_confidence_floor() if "door" in camera_features else None,
+            "damage": (damage_confidence_floor()
+                       if "damage" in camera_features else None)}})
+    # The gates are part of the contract: they decide which detections become
+    # evidence, so they are recorded and they take part in the config digest.
+    gates = {}
+    if "door" in camera_features:
+        gates["door_confidence_floor"] = door_confidence_floor()
+    if "damage" in camera_features:
+        gates["damage_confidence_floor"] = damage_confidence_floor()
     feature_config = {"features": list(camera_features),
                       "strides": {name: strides[name]
-                                  for name in camera_features}}
+                                  for name in camera_features},
+                      "gates": gates}
 
     if verbose:
         print("[SEQ] Camera %s START" % camera_id)

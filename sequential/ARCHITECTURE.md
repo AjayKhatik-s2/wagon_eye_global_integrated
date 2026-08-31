@@ -85,25 +85,46 @@ sequential.global_assembly.assemble()            # exactly ONCE
 6. Door 3 / Damage 3 / Load 2 sampling unchanged; OCR off unless selected.
 7. `global_count_ec2` is frozen and unmodified.
 
+## Parity with Batch — how each decision is kept identical
+
+| Decision | Shared mechanism |
+|---|---|
+| Door detection gate | `TrackerConfig().closed_confidence_threshold`, read from Batch's own config object |
+| Damage detection gate | `features.damage.processor._filter_detections_for_top`, called directly |
+| Door aggregation | `EvidenceAggregator` + `_door_evidence_from_groups` + `_pick_side_state` + `order_doors` + `wagon_door_status` |
+| Door class mapping | `C.DOOR_LABEL_TO_STATE` / `door_processor._canonical` |
+| Load verdict | `_LOADED_RATIO_THRESHOLD` and Batch's `used` denominator and branch order |
+| Alignment + reversal | the engine's `estimate_alignment` (both directions tested) |
+| Projection into a camera | the alignment's own `project_to_camera` (mirrors when reversed) |
+| Wagon ownership | `core.wagon_ownership` (ef2868f) |
+| Canonical contract | `global_counting.adapter`, the same builder Batch uses |
+
+Nothing in that column is a copy: Sequential calls the same object Batch calls.
+`tests/test_batch_sequential_parity.py` (30 tests) compares the two paths at
+each point, and asserts a second implementation has not appeared.
+
+## Classification: the one mirrored piece
+
+The engine's only classification entry point takes a **video path** and owns its
+own `VideoCapture`, so it cannot be reused without decoding the video a second
+time — which is the invariant Sequential exists to uphold. The per-frame verdict
+is therefore reproduced in `sequential/classification_adapter.py`, and nowhere
+else. Everything it uses is the engine's: model_info, class maps, the
+confidence threshold, `BATCH_SIZE`, `DEVICE_YOLO`, and the batch→per-frame
+fallback.
+
+`tests/test_classification_adapter_contract.py` runs the REAL
+`classify_video_frames` and the adapter over the SAME frames and requires the
+records to be identical field for field, and separately asserts the engine still
+contains the record keys and threshold comparison being mirrored. It also fails
+if the engine ever gains a frame-based entry point, so the mirror gets deleted
+rather than forgotten.
+
 ## Known limitations (not yet resolved)
 
-1. **Door/Damage confidence gates.** The camera stage persists RAW detections.
-   Batch's Door and Damage processors apply a per-model confidence gate
-   (`min_conf`, `confidence_floor`) before aggregating; Global Assembly
-   currently relies on `EvidenceAggregator`'s acceptance rules alone. Structure
-   (gaps, roster, boundaries, ownership) and Load are unaffected, but Door and
-   Damage verdicts may differ from Batch on marginal detections. Batch remains
-   the authority for feature facts until a parity run on real footage passes.
-2. **Classification batch logic is mirrored, not imported.** The engine's
-   `_classify_batch` is a closure inside `classify_video_frames` and cannot be
-   called on its own, so `camera_runner._flush_classification` reproduces it
-   using the engine's model_info, class map and threshold. An opt-in parity
-   check against `classify_video_frames` on real footage is the way to keep
-   this honest if the engine ever changes.
-3. **No real end-to-end run has been performed** for Sequential. Every test
-   here uses a stub engine and a fake video capture.
-4. **Reversed cameras.** The Sequential harvest sets `is_reversed=False`; the
-   alignment path used here matches positions monotonically and does not yet
-   detect a fully reversed support camera the way the engine's own
-   `estimate_alignment` does. Batch handles reversal; Sequential would treat a
-   reversed camera as unmatched rather than mis-assign it.
+1. **No real end-to-end run has been performed** in Sequential mode. Every test
+   uses a stub engine and a fake video capture. Batch remains the mode with a
+   real-footage history.
+2. The gap detector runs on every decoded frame, including outside the wagon
+   region, which the engine avoids by detecting on the trimmed clip. Results are
+   unchanged (the tracker sees the same slice); the cost is extra inference.

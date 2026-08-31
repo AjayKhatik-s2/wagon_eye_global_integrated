@@ -243,7 +243,65 @@ def write_global_gap_timeline(path): open(str(path), "w").close()
 ''',
 
 "io_paths.py": "VIDEO_PATHS = {}\nOUTPUT_DIR = None\n",
-"global_alignment.py": '''
+"global_alignment.py": """
+import numpy as np
+
+NORMALIZED_TIMELINE_SCALE = 1000.0
+GLOBAL_ALIGNMENT_TOLERANCE = 20.0
+ALLOW_TIMELINE_REVERSAL = True
+REVERSAL_MIN_EXTRA_MATCHES = 1
+REVERSAL_MIN_EXTRA_MATCH_RATIO = 0.0
+REVERSAL_MIN_ERROR_IMPROVEMENT = 0.5
+
+GAP_TIMELINES = {}
+CAMERA_ALIGNMENTS = {}
+MASTER_CAMERA = None
+MASTER_TIMELINE = None
+MASTER_GAP_COUNT = 0
+MASTER_POSITIONS = None
+MASTER_DURATIONS = None
+MASTER_GAP_ID_LIST = []
+GLOBAL_GAP_IDS = []
+GLOBAL_GAP_COUNT = 0
+
+
+class CameraAlignment(object):
+    def __init__(self, camera, master=None):
+        self.camera = camera
+        self.master = master
+        self.scale = 1.0
+        self.offset = 0.0
+        self.is_reversed = False
+        self.matches = []
+        self.matched_master_indices = set()
+        self.matched_camera_indices = set()
+        self.unmatched_camera_indices = []
+        self.status = "NOT_ESTIMATED"
+        self.fit_note = ""
+        self.n_master = 0
+        self.n_camera = 0
+        self.errors = np.array([])
+
+    def project_to_camera(self, master_position):
+        value = self.scale * float(master_position) + self.offset
+        return NORMALIZED_TIMELINE_SCALE - value if self.is_reversed else value
+
+    def project_to_master(self, camera_position):
+        value = (NORMALIZED_TIMELINE_SCALE - float(camera_position)
+                 if self.is_reversed else float(camera_position))
+        if abs(self.scale) < 1e-12:
+            return float("nan")
+        return (value - self.offset) / self.scale
+
+    @property
+    def matched_count(self):
+        return len(self.matches)
+
+    @property
+    def mean_error(self):
+        return float(np.mean(self.errors)) if self.errors.size else float("inf")
+
+
 def monotonic_gap_match(master_positions, camera_positions, tolerance,
                         master_durations=None, camera_durations=None,
                         duration_weight=None):
@@ -262,9 +320,104 @@ def monotonic_gap_match(master_positions, camera_positions, tolerance,
                             "error": best_error, "score": 1.0})
     return matches
 
+
 def robust_linear_fit(x, y):
-    return (1.0, 0.0, len(x), "stub")
-''',
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size >= 2 and float(np.ptp(x)) > 1e-9:
+        scale, offset = np.polyfit(x, y, 1)
+        return (float(scale), float(offset), int(x.size), "lstsq")
+    return (1.0, 0.0, int(x.size), "identity")
+
+
+def _estimate_one_direction(master_positions, master_durations,
+                            camera_positions, camera_durations):
+    matches = monotonic_gap_match(master_positions, camera_positions,
+                                  GLOBAL_ALIGNMENT_TOLERANCE)
+    scale, offset, note = 1.0, 0.0, "identity"
+    if len(matches) >= 2:
+        scale, offset, _n, note = robust_linear_fit(
+            [master_positions[m["master_index"]] for m in matches],
+            [camera_positions[m["camera_index"]] for m in matches])
+        matches = monotonic_gap_match(
+            scale * np.asarray(master_positions, dtype=float) + offset,
+            camera_positions, GLOBAL_ALIGNMENT_TOLERANCE)
+    return scale, offset, matches, note
+
+
+def estimate_alignment(camera, verbose=True):
+    if camera == MASTER_CAMERA and CAMERA_ALIGNMENTS.get(MASTER_CAMERA):
+        return CAMERA_ALIGNMENTS[MASTER_CAMERA]
+
+    alignment = CameraAlignment(camera, MASTER_CAMERA)
+    frame = GAP_TIMELINES[camera]
+    alignment.n_master = MASTER_GAP_COUNT
+    alignment.n_camera = int(len(frame))
+    if alignment.n_camera == 0:
+        alignment.status = "NO_CAMERA_GAPS"
+        CAMERA_ALIGNMENTS[camera] = alignment
+        return alignment
+
+    positions = frame["normalized_confirmation_time"].to_numpy(dtype=float)
+    durations = frame["normalized_duration"].to_numpy(dtype=float)
+
+    f_scale, f_offset, f_matches, f_note = _estimate_one_direction(
+        MASTER_POSITIONS, MASTER_DURATIONS, positions, durations)
+    f_err = np.array([m["error"] for m in f_matches], dtype=float)
+    f_mean = float(np.mean(f_err)) if f_err.size else float("inf")
+
+    r_matches, r_scale, r_offset, r_note, r_mean = [], 1.0, 0.0, "", float("inf")
+    reversed_positions = (NORMALIZED_TIMELINE_SCALE - positions)[::-1]
+    reversed_durations = durations[::-1]
+    if ALLOW_TIMELINE_REVERSAL and alignment.n_camera >= 3:
+        r_scale, r_offset, r_matches, r_note = _estimate_one_direction(
+            MASTER_POSITIONS, MASTER_DURATIONS, reversed_positions,
+            reversed_durations)
+        r_err = np.array([m["error"] for m in r_matches], dtype=float)
+        r_mean = float(np.mean(r_err)) if r_err.size else float("inf")
+
+    required = max(len(f_matches) * (1.0 + REVERSAL_MIN_EXTRA_MATCH_RATIO),
+                   len(f_matches) + REVERSAL_MIN_EXTRA_MATCHES)
+    wins_on_count = bool(len(r_matches) >= required and r_mean <= f_mean)
+    wins_on_error = bool(len(r_matches) >= len(f_matches)
+                         and np.isfinite(r_mean)
+                         and r_mean < f_mean * REVERSAL_MIN_ERROR_IMPROVEMENT)
+    adopt_reversed = bool(wins_on_count or wins_on_error)
+
+    if adopt_reversed:
+        alignment.is_reversed = True
+        alignment.scale, alignment.offset = r_scale, r_offset
+        alignment.fit_note = r_note
+        raw = r_matches
+        index_map = {k: alignment.n_camera - 1 - k
+                     for k in range(alignment.n_camera)}
+    else:
+        alignment.scale, alignment.offset = f_scale, f_offset
+        alignment.fit_note = f_note
+        raw = f_matches
+        index_map = {k: k for k in range(alignment.n_camera)}
+
+    matches = []
+    for match in raw:
+        camera_index = index_map[match["camera_index"]]
+        back = alignment.project_to_master(float(positions[camera_index]))
+        matches.append({
+            "master_index": match["master_index"],
+            "camera_index": camera_index,
+            "error": abs(float(MASTER_POSITIONS[match["master_index"]])
+                         - float(back)),
+        })
+    matches.sort(key=lambda m: m["master_index"])
+    alignment.matches = matches
+    alignment.errors = np.array([m["error"] for m in matches], dtype=float)
+    alignment.matched_camera_indices = {m["camera_index"] for m in matches}
+    alignment.unmatched_camera_indices = [
+        j for j in range(alignment.n_camera)
+        if j not in alignment.matched_camera_indices]
+    alignment.status = "GOOD" if matches else "FAILED_NO_MATCHES"
+    CAMERA_ALIGNMENTS[camera] = alignment
+    return alignment
+""",
 "utils.py": "def banner(text):\n    pass\n",
 "gap_annotation.py": "", "snapshot_extraction.py": "", "pdf_report.py": "",
 "visualization.py": "", "wagon_mapping.py": "GLOBAL_WAGONS = []\nGLOBAL_WAGON_COUNT = 0\n",
@@ -337,18 +490,55 @@ def wired(monkeypatch, stub_engine):
 
     calls = {"door": [], "damage": [], "load": []}
 
-    def _fake_load_yolo(path):
-        return types.SimpleNamespace(name=os.path.basename(path or ""))
+    # A centred, high-confidence box that survives Batch's REAL gates on merit:
+    # conf 0.9 >= door 0.68 and >= damage 0.55; area ratio 0.104 inside
+    # [0.005, 0.40]; centre (0.47, 0.50) clear of every edge zone.
+    BBOX = [100.0, 80.0, 200.0, 160.0]
 
-    def _fake_run_detection(model, frame, confidence=0.4, half=False):
-        index = int(frame[0, 0, 0])
-        name = getattr(model, "name", "")
-        feature = "door" if "door" in name else "damage"
-        calls[feature].append(index)
-        state = "open_door" if feature == "door" and index % 2 else (
-            "closed_door" if feature == "door" else "dent")
-        return [{"class_id": 0, "class_name": state, "confidence": 0.9,
-                 "bbox": [10.0, 10.0, 60.0, 120.0]}]
+    class _Arr:
+        def __init__(self, value):
+            self._value = value
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.asarray(self._value)
+
+    class _Boxes:
+        def __init__(self, bbox, conf, cls_id):
+            self.xyxy = _Arr([bbox])
+            self.conf = _Arr([conf])
+            self.cls = _Arr([cls_id])
+
+        def __len__(self):
+            return 1
+
+    class _Result:
+        def __init__(self, boxes):
+            self.boxes = boxes
+
+    class _FakeYolo:
+        """Callable like a YOLO model; records every frame it was shown."""
+
+        def __init__(self, feature, names):
+            self.feature = feature
+            self.names = names
+
+        def __call__(self, frame, **kwargs):
+            index = int(frame[0, 0, 0])
+            calls[self.feature].append(index)
+            # Door alternates open/closed so multi-door survival is observable.
+            cls_id = 1 if (self.feature == "door" and index % 2) else 0
+            return [_Result(_Boxes(BBOX, 0.9, cls_id))]
+
+    def _fake_load_yolo(path):
+        name = os.path.basename(path or "")
+        if "door" in name:
+            return _FakeYolo("door", {0: "closed_door", 1: "open_door"})
+        if "damage" in name:
+            return _FakeYolo("damage", {0: "dent"})
+        return _FakeYolo("load", {0: "loaded"})
 
     def _fake_run_classification(model, frame):
         calls["load"].append(int(frame[0, 0, 0]))
@@ -356,7 +546,6 @@ def wired(monkeypatch, stub_engine):
 
     from features import _common
     monkeypatch.setattr(_common, "load_yolo", _fake_load_yolo)
-    monkeypatch.setattr(_common, "run_detection", _fake_run_detection)
     monkeypatch.setattr(_common, "run_classification", _fake_run_classification)
     return calls
 

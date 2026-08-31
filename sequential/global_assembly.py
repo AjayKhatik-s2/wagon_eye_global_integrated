@@ -23,22 +23,25 @@ enforces by inspecting its source:
   builder Batch uses, so both modes emit the identical schema (including
   `camera_frame_ranges` and `global_gaps`) and stay comparable.
 
-KNOWN GAP -- read before trusting Sequential feature numbers
-------------------------------------------------------------
-The camera stage stores RAW detections, which is deliberate: filtering is a
-decision, and decisions belong here. But Batch's Door and Damage processors
-apply their own per-model confidence gate BEFORE aggregating (`min_conf` for
-door, `confidence_floor` for damage), and this module currently relies on
-`EvidenceAggregator`'s acceptance rules alone. Gap detection, the canonical
-timeline, the roster, ownership and Load are unaffected; Door and Damage
-verdicts could differ from Batch on marginal detections.
+CONFIDENCE GATING -- identical to Batch, by reuse
+------------------------------------------------
+The camera stage gates detections with Batch's OWN code before persisting them:
+Door with `TrackerConfig().closed_confidence_threshold` and Damage with
+`features.damage.processor._filter_detections_for_top` (floor, skip classes,
+area ratio, edge-zone suppression). So the surviving detection set for a given
+frame is the same set Batch would keep, and the aggregation below then feeds the
+same `EvidenceAggregator` groups through the same Door helpers. Load uses
+Batch's `_LOADED_RATIO_THRESHOLD` and its `used` denominator.
+`tests/test_batch_sequential_parity.py` compares both paths at each of those
+decision points.
 
-So Sequential's STRUCTURE (gap count, roster, boundaries, ownership) is
-test-covered, while its Door/Damage verdicts are NOT yet proven equal to
-Batch. A Batch-vs-Sequential parity run on real footage is the outstanding
-validation step; until it passes, treat Batch as the authority for feature
-facts. Persisting the gates in the evidence and applying them here is the
-intended fix.
+Alignment, including reversal, is the engine's own `estimate_alignment` driven
+from persisted timelines, and projection is the alignment's own
+`project_to_camera`, so a reversed support camera behaves exactly as it does in
+Batch.
+
+Still outstanding: NO real end-to-end run has been performed in Sequential
+mode. Every test uses a stub engine and a fake video capture.
 """
 
 from __future__ import annotations
@@ -130,66 +133,131 @@ def _frame_for_position(camera_evidence: ev.CameraEvidence,
     return timing.wagon_region_start_frame + offset
 
 
-def align_camera(engine, canonical_positions: Sequence[float],
-                 camera_evidence: ev.CameraEvidence,
-                 ) -> Dict[str, Any]:
-    """Match one support camera's local gaps against the canonical sequence.
+def _gap_frame(camera_evidence: ev.CameraEvidence):
+    """One camera's persisted gap timeline as the DataFrame the engine expects."""
+    import pandas as pd
 
-    Uses the engine's validated `monotonic_gap_match` (order preserving, no
-    crossing matches) and `robust_linear_fit`, both pure. Unmatched CAMERA gaps
-    are recorded as diagnostics and never become wagons.
+    return pd.DataFrame([
+        {"local_gap_id": gap.local_gap_id,
+         "normalized_confirmation_time": float(gap.normalized_position),
+         "normalized_duration": float(gap.normalized_duration)}
+        for gap in camera_evidence.gaps
+    ], columns=["local_gap_id", "normalized_confirmation_time",
+                "normalized_duration"])
+
+
+def populate_engine_alignment_state(global_alignment, evidences, master_id):
+    """Load the persisted timelines into the engine's alignment state.
+
+    This is state population, NOT algorithm reimplementation: the engine's
+    `estimate_alignment` reads `GAP_TIMELINES` and the `MASTER_*` arrays from
+    its own module, so filling those from sealed evidence lets Sequential call
+    the SAME validated function Batch's engine run calls -- including its
+    scale-grid seeding, its iterative robust fit, its duration-weighted
+    matching and its reversed-orientation test. Nothing is decoded and no model
+    is touched.
+    """
+    import numpy as np
+
+    master_key = gc_runner.CAMERA_ID_TO_KEY[master_id]
+
+    global_alignment.GAP_TIMELINES.clear()
+    global_alignment.CAMERA_ALIGNMENTS.clear()
+    for camera_id, camera_evidence in evidences.items():
+        global_alignment.GAP_TIMELINES[
+            gc_runner.CAMERA_ID_TO_KEY[camera_id]] = _gap_frame(camera_evidence)
+
+    master_frame = global_alignment.GAP_TIMELINES[master_key]
+    global_alignment.MASTER_CAMERA = master_key
+    global_alignment.MASTER_TIMELINE = master_frame
+    global_alignment.MASTER_GAP_COUNT = int(len(master_frame))
+    global_alignment.MASTER_POSITIONS = master_frame[
+        "normalized_confirmation_time"].to_numpy(dtype=float)
+    global_alignment.MASTER_DURATIONS = master_frame[
+        "normalized_duration"].to_numpy(dtype=float)
+    global_alignment.MASTER_GAP_ID_LIST = list(master_frame["local_gap_id"])
+    global_alignment.GLOBAL_GAP_IDS = [
+        "GLOBAL_G%03d" % (index + 1)
+        for index in range(global_alignment.MASTER_GAP_COUNT)]
+    global_alignment.GLOBAL_GAP_COUNT = global_alignment.MASTER_GAP_COUNT
+
+    # The master is aligned to itself by definition; `estimate_alignment`
+    # returns this identity registration rather than matching it to itself.
+    identity = global_alignment.CameraAlignment(master_key, master_key)
+    identity.scale, identity.offset = 1.0, 0.0
+    identity.is_reversed = False
+    identity.status = "MASTER"
+    identity.fit_note = "identity (canonical gap authority)"
+    identity.n_master = identity.n_camera = global_alignment.MASTER_GAP_COUNT
+    identity.matches = [
+        {"master_index": index, "camera_index": index,
+         "master_position": float(global_alignment.MASTER_POSITIONS[index]),
+         "camera_position": float(global_alignment.MASTER_POSITIONS[index]),
+         "error": 0.0}
+        for index in range(global_alignment.MASTER_GAP_COUNT)]
+    identity.errors = np.zeros(global_alignment.MASTER_GAP_COUNT, dtype=float)
+    identity.matched_master_indices = set(
+        range(global_alignment.MASTER_GAP_COUNT))
+    identity.matched_camera_indices = set(
+        range(global_alignment.MASTER_GAP_COUNT))
+    identity.unmatched_camera_indices = []
+    global_alignment.CAMERA_ALIGNMENTS[master_key] = identity
+    return identity
+
+
+def align_camera(engine, camera_id: str, camera_evidence: ev.CameraEvidence,
+                 ) -> Dict[str, Any]:
+    """Align one support camera by calling the engine's own estimator.
+
+    Forward vs reversed is decided by `estimate_alignment`, which tests both
+    orientations and adopts a reversal only when the gap sequence proves it.
+    Projection back into the camera uses the alignment's own
+    `project_to_camera`, which applies the mirror for a reversed camera -- so a
+    canonical RIGHT_UP gap lands on the correct frame of a camera that runs
+    backwards, with no second algorithm involved.
     """
     global_alignment = engine["global_alignment"]
-    config = engine["config"]
+    camera_key = gc_runner.CAMERA_ID_TO_KEY[camera_id]
 
+    alignment = global_alignment.estimate_alignment(camera_key, verbose=False)
+    canonical_positions = list(global_alignment.MASTER_POSITIONS)
     camera_positions = [gap.normalized_position for gap in camera_evidence.gaps]
-    if not canonical_positions or not camera_positions:
-        return {"matches": [], "scale": 1.0, "offset": 0.0,
-                "status": "NO_GAPS", "extra_camera_gaps": [],
-                "projected_positions": list(canonical_positions),
-                "matched_count": 0}
 
-    matches = global_alignment.monotonic_gap_match(
-        list(canonical_positions), camera_positions,
-        float(config.GLOBAL_ALIGNMENT_TOLERANCE))
+    detected = {match["master_index"]: match["camera_index"]
+                for match in (alignment.matches or [])}
+    projected: List[float] = []
+    for index, canonical in enumerate(canonical_positions):
+        camera_index = detected.get(index)
+        if camera_index is not None and camera_index < len(camera_positions):
+            # This camera measured the gap: prefer its own observation, exactly
+            # as the engine's wagon mapping prefers a DETECTED boundary.
+            projected.append(float(camera_positions[camera_index]))
+        else:
+            # Missed here -> the canonical gap stands and is projected in.
+            projected.append(float(alignment.project_to_camera(canonical)))
 
-    scale, offset, used, note = 1.0, 0.0, 0, "identity"
-    if len(matches) >= 2:
-        scale, offset, used, note = global_alignment.robust_linear_fit(
-            [canonical_positions[m["master_index"]] for m in matches],
-            [camera_positions[m["camera_index"]] for m in matches])
-    elif len(matches) == 1:
-        offset = (camera_positions[matches[0]["camera_index"]]
-                  - canonical_positions[matches[0]["master_index"]])
-        note = "single match: offset only"
-
-    matched_camera = {m["camera_index"] for m in matches}
     extra = [
         {"local_gap_id": camera_evidence.gaps[index].local_gap_id,
          "normalized_position": camera_evidence.gaps[index].normalized_position,
          "note": "seen only by this camera; DIAGNOSTIC, never a canonical wagon"}
-        for index in range(len(camera_positions)) if index not in matched_camera
+        for index in (alignment.unmatched_camera_indices or [])
+        if index < len(camera_evidence.gaps)
     ]
 
-    by_master = {m["master_index"]: m for m in matches}
-    projected: List[float] = []
-    for index, canonical in enumerate(canonical_positions):
-        match = by_master.get(index)
-        if match is not None:
-            # This camera measured it: prefer its own observation.
-            projected.append(camera_positions[match["camera_index"]])
-        else:
-            # Missed here -> the canonical gap still holds and is projected in.
-            projected.append(float(scale) * float(canonical) + float(offset))
-
     return {
-        "matches": matches,
-        "scale": float(scale), "offset": float(offset),
-        "fit_note": note, "fit_points": int(used),
-        "status": "RESOLVED" if matches else "UNRESOLVED",
+        "matches": [{"master_index": m["master_index"],
+                     "camera_index": m["camera_index"],
+                     "error": m.get("error", 0.0)}
+                    for m in (alignment.matches or [])],
+        "scale": float(alignment.scale), "offset": float(alignment.offset),
+        "is_reversed": bool(alignment.is_reversed),
+        "fit_note": str(alignment.fit_note),
+        "status": str(alignment.status),
+        "mean_error": (float(alignment.mean_error)
+                       if alignment.matched_count else None),
         "extra_camera_gaps": extra,
         "projected_positions": projected,
-        "matched_count": len(matches),
+        "matched_count": int(alignment.matched_count),
     }
 
 
@@ -203,7 +271,13 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
     """
     master_id = C.MASTER_CAMERA
     master = evidences[master_id]
-    canonical_positions = [gap.normalized_position for gap in master.gaps]
+
+    # Load the persisted timelines into the engine's alignment state, then let
+    # the engine's own estimator decide each camera's direction and mapping.
+    populate_engine_alignment_state(
+        engine["global_alignment"], evidences, master_id)
+    canonical_positions = [float(p) for p in
+                           engine["global_alignment"].MASTER_POSITIONS]
     gap_count = len(canonical_positions)
 
     alignments: Dict[str, Dict[str, Any]] = {}
@@ -217,21 +291,22 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
             alignments[camera_id] = {"status": "ABSENT", "matches": [],
                                      "extra_camera_gaps": [],
                                      "projected_positions": [],
-                                     "matched_count": 0,
+                                     "matched_count": 0, "is_reversed": False,
                                      "scale": 1.0, "offset": 0.0}
             continue
 
         if camera_id == master_id:
             alignment = {"matches": [{"master_index": i, "camera_index": i,
-                                      "error": 0.0, "score": 1.0}
+                                      "error": 0.0}
                                      for i in range(gap_count)],
-                         "scale": 1.0, "offset": 0.0, "fit_note": "authority",
-                         "fit_points": gap_count, "status": "MASTER",
+                         "scale": 1.0, "offset": 0.0,
+                         "fit_note": "identity (canonical gap authority)",
+                         "status": "MASTER", "is_reversed": False,
                          "extra_camera_gaps": [],
                          "projected_positions": list(canonical_positions),
                          "matched_count": gap_count}
         else:
-            alignment = align_camera(engine, canonical_positions, camera_evidence)
+            alignment = align_camera(engine, camera_id, camera_evidence)
         alignments[camera_id] = alignment
 
         timing = camera_evidence.timing
@@ -245,7 +320,7 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
             unique_gap_count=camera_evidence.unique_gap_count,
             trim_status=camera_evidence.status,
             alignment_status=str(alignment.get("status")),
-            is_reversed=False,
+            is_reversed=bool(alignment.get("is_reversed", False)),
             scale=float(alignment.get("scale", 1.0)),
             offset=float(alignment.get("offset", 0.0)),
             matched_gaps=int(alignment.get("matched_count", 0)))
@@ -279,7 +354,8 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
                       else adapter.STATUS_RECOVERED)
             wagon.cameras[camera_id] = {
                 "start_frame": start_frame, "end_frame": end_frame,
-                "status": status, "reversed": False,
+                "status": status,
+                "reversed": bool(alignment.get("is_reversed", False)),
                 "start_position": low_position, "end_position": high_position}
         wagons.append(wagon)
 
@@ -460,31 +536,54 @@ def _aggregate_damage(gw_id: str, per_camera: Dict[str, List[Any]],
 
 def _aggregate_load(gw_id: str, per_camera: Dict[str, List[Any]],
                     ) -> Dict[str, Any]:
-    """The existing Load rule: `loaded / total > 0.35`, confidence = winner mean."""
-    from features.load import processor as load_proc
+    """Batch's Load rule, with Batch's own threshold constant and branch order.
 
-    loaded, empty = [], []
+    `total` counts EVERY sampled observation -- Batch uses `used`, not
+    `n_loaded + n_empty` -- so a frame classified as neither loaded nor empty
+    still dilutes the ratio. Getting that wrong would shift the verdict on
+    wagons with third-class frames, so the constant and the branches are taken
+    from the Batch module rather than restated.
+    """
+    from features.load.processor import _LOADED_RATIO_THRESHOLD, _canonical_load
+
+    loaded_confs: List[float] = []
+    empty_confs: List[float] = []
+    used = 0
     for observations in per_camera.values():
         for observation in observations:
-            canonical = load_proc._canonical_load(observation.raw_class)
-            (loaded if canonical == C.LOAD_LOADED else empty).append(
-                observation.confidence)
-    total = len(loaded) + len(empty)
-    if not total:
-        return {"global_id": gw_id, "feature": "load", "status": C.NO_DATA,
-                "load_status": C.NO_DATA, "load_confidence": 0.0,
-                "source": "global_assembly_from_persisted_evidence"}
-    is_loaded = (len(loaded) / float(total)) > 0.35
-    winners = loaded if is_loaded else empty
-    return {
-        "global_id": gw_id, "feature": "load", "status": C.STATUS_OK,
-        "load_status": C.LOAD_LOADED if is_loaded else C.LOAD_EMPTY,
-        "load_confidence": round(sum(winners) / max(1, len(winners)), 4),
-        "frames_used": total, "loaded_frames": len(loaded),
-        "empty_frames": len(empty),
-        "supporting_cameras": sorted(per_camera),
-        "source": "global_assembly_from_persisted_evidence",
-    }
+            used += 1
+            canonical = _canonical_load(observation.raw_class)
+            if canonical == C.LOAD_LOADED:
+                loaded_confs.append(float(observation.confidence))
+            elif canonical == C.LOAD_EMPTY:
+                empty_confs.append(float(observation.confidence))
+
+    base = {"global_id": gw_id, "feature": "load",
+            "frames_used": used, "loaded_frames": len(loaded_confs),
+            "empty_frames": len(empty_confs),
+            "supporting_cameras": sorted(per_camera),
+            "source": "global_assembly_from_persisted_evidence"}
+
+    if used == 0:
+        base.update({"status": C.NO_DATA, "load_status": C.NO_DATA,
+                     "load_confidence": 0.0})
+        return base
+
+    total = max(1, used)
+    loaded_ratio = len(loaded_confs) / total
+    if loaded_ratio > _LOADED_RATIO_THRESHOLD and loaded_confs:
+        base.update({
+            "status": C.STATUS_OK, "load_status": C.LOAD_LOADED,
+            "load_confidence": round(sum(loaded_confs) / len(loaded_confs), 4)})
+        return base
+    if empty_confs:
+        base.update({
+            "status": C.STATUS_OK, "load_status": C.LOAD_EMPTY,
+            "load_confidence": round(sum(empty_confs) / len(empty_confs), 4)})
+        return base
+    base.update({"status": C.NO_DATA, "load_status": C.NO_DATA,
+                 "load_confidence": 0.0})
+    return base
 
 
 # -----------------------------------------------------------------------------

@@ -35,8 +35,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from core import constants as C
 
-SCHEMA_VERSION = "wagon_eye.camera_evidence.v2"
-SEAL_SCHEMA_VERSION = "wagon_eye.camera_seal.v2"
+SCHEMA_VERSION = "wagon_eye.camera_evidence.v3"
+SEAL_SCHEMA_VERSION = "wagon_eye.camera_seal.v3"
 
 EVIDENCE_DIRNAME = "camera_evidence"
 CAMERA_REPORTS_DIRNAME = "camera_reports"
@@ -137,6 +137,11 @@ class GapObservation:
     max_confidence: float
     average_confidence: float = 0.0
     frame_count: int = 0
+    # The engine's `monotonic_gap_match` weights candidate pairs by duration
+    # similarity, and `estimate_alignment` needs the duration array to test the
+    # reversed orientation. Persisting it keeps Global Assembly able to call
+    # the validated alignment instead of a reduced stand-in.
+    normalized_duration: float = 0.0
 
 
 @dataclass
