@@ -84,6 +84,8 @@ class AssemblyResult:
     state_json_path: Optional[str] = None
     report_json_path: Optional[str] = None
     report_pdf_path: Optional[str] = None
+    # The VALIDATED per-camera reports (Batch's Stage 5a), keyed by camera id.
+    camera_report_paths: Dict[str, Optional[str]] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -587,6 +589,160 @@ def _aggregate_load(gw_id: str, per_camera: Dict[str, List[Any]],
 
 
 # -----------------------------------------------------------------------------
+# Per-wagon evidence placement (copy only -- never a decode, never inference)
+# -----------------------------------------------------------------------------
+
+# The evidence slots Batch's camera report reads, per camera.
+DOOR_SLOT = {C.CAMERA_LEFT_UP: "left_best", C.CAMERA_RIGHT_UP: "right_best"}
+
+
+def _pick_snapshot(camera_evidence, feature: str, state: str,
+                   frame_idx: int) -> Optional[str]:
+    """The camera-local snapshot nearest this frame for (feature, state).
+
+    The camera stage stored one best frame per (feature, state, bucket); this
+    picks the bucket the frame falls in, then the closest available bucket, so
+    a wagon always gets a real frame of ITS OWN region when one exists.
+    """
+    bucket_frames = int(camera_evidence.provenance.get(
+        "snapshot_bucket_frames") or 0)
+    if bucket_frames <= 0 or not camera_evidence.snapshots:
+        return None
+    wanted = int(frame_idx) // bucket_frames
+    prefix = "%s/%s/" % (feature, state or "any")
+    candidates = []
+    for relative, absolute in camera_evidence.snapshots.items():
+        if not relative.startswith(prefix):
+            continue
+        try:
+            bucket = int(relative.rsplit("/b", 1)[1].split(".")[0])
+        except (IndexError, ValueError):
+            continue
+        candidates.append((abs(bucket - wanted), absolute))
+    if not candidates:
+        return None
+    candidates.sort()
+    best = candidates[0][1]
+    return best if os.path.isfile(best) else None
+
+
+def _plain_frame_for(camera_evidence, window) -> Optional[str]:
+    """A real, unannotated frame inside this wagon's window on this camera."""
+    if window is None or not camera_evidence.snapshots:
+        return None
+    low, high = window
+    best = None
+    for relative, absolute in camera_evidence.snapshots.items():
+        if not relative.startswith("frames/f"):
+            continue
+        try:
+            frame_idx = int(relative.rsplit("/f", 1)[1].split(".")[0])
+        except (IndexError, ValueError):
+            continue
+        if low <= frame_idx <= high and os.path.isfile(absolute):
+            distance = abs(frame_idx - (low + high) // 2)
+            if best is None or distance < best[0]:
+                best = (distance, frame_idx, absolute)
+    return None if best is None else best[2]
+
+
+def place_wagon_evidence(*, state, evidences, assigned, door_payloads,
+                         damage_payloads, evidence_root: str, cache_root: str,
+                         verbose: bool = True) -> Dict[str, int]:
+    """Copy camera-local snapshots into the per-wagon layout Batch reads.
+
+    Two destinations, both exactly where `reporting.camera_reports` looks:
+      * `wagon_cache/<GW>/<camera>/frame_NNNNNN.jpg` -- one real frame, so
+        "visible to this camera" is answered from evidence instead of guessed;
+      * `evidence/<GW>/<feature>/<slot>.jpg` -- the door/load/damage snapshots
+        the report renders.
+    """
+    import shutil
+
+    counts = {"frames": 0, "door": 0, "load": 0, "damage": 0}
+    for wagon in state.wagons:
+        features = assigned.get(wagon.global_id) or {}
+        for camera_id, camera_evidence in evidences.items():
+            window = wagon.local_range(camera_id)
+
+            # ---- visibility: a real frame from this camera's own window ----
+            plain = _plain_frame_for(camera_evidence, window)
+            if plain:
+                destination = os.path.join(
+                    cache_root, wagon.global_id, C.CAMERA_FOLDER[camera_id])
+                os.makedirs(destination, exist_ok=True)
+                shutil.copyfile(plain, os.path.join(
+                    destination, os.path.basename(plain).replace("f", "frame_")))
+                counts["frames"] += 1
+
+            # ---- door: the side slot for this camera ----------------------
+            slot = DOOR_SLOT.get(camera_id)
+            door_observations = (features.get("door") or {}).get(camera_id) or []
+            if slot and door_observations:
+                strongest = max(door_observations, key=lambda o: o.score)
+                snapshot = _pick_snapshot(camera_evidence, "door",
+                                          strongest.raw_class,
+                                          strongest.frame_idx)
+                if snapshot:
+                    target = os.path.join(evidence_root, wagon.global_id,
+                                          "door", "%s.jpg" % slot)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    shutil.copyfile(snapshot, target)
+                    counts["door"] += 1
+
+            # ---- load: one best frame ------------------------------------
+            load_observations = (features.get("load") or {}).get(camera_id) or []
+            if load_observations and camera_id == C.CAMERA_RIGHT_UP_TOP:
+                strongest = max(load_observations, key=lambda o: o.confidence)
+                snapshot = _pick_snapshot(camera_evidence, "load",
+                                          strongest.raw_class,
+                                          strongest.frame_idx)
+                if snapshot:
+                    target = os.path.join(evidence_root, wagon.global_id,
+                                          "load", "best_frame.jpg")
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    shutil.copyfile(snapshot, target)
+                    counts["load"] += 1
+
+        # ---- damage: one snapshot per aggregated track + the metadata ----
+        payload = damage_payloads.get(wagon.global_id)
+        if payload:
+            tracks = []
+            for index, track in enumerate(payload.get("top_damage_details") or [],
+                                          start=1):
+                camera_evidence = evidences.get(track.get("camera_id"))
+                snapshot = None
+                if camera_evidence is not None:
+                    snapshot = _pick_snapshot(
+                        camera_evidence, "damage", track.get("class_name"),
+                        int(track.get("best_frame_idx") or 0))
+                entry = dict(track)
+                entry["track_idx"] = index
+                if snapshot:
+                    target = os.path.join(evidence_root, wagon.global_id,
+                                          "damage", "track_%d.jpg" % index)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    shutil.copyfile(snapshot, target)
+                    counts["damage"] += 1
+                tracks.append(entry)
+            if tracks:
+                from features._evidence import write_metadata
+                write_metadata(
+                    os.path.join(evidence_root, wagon.global_id, "damage",
+                                 "metadata.json"),
+                    {"global_id": wagon.global_id, "feature": "damage",
+                     "top_damage": payload.get("top_damage"),
+                     "tracks": tracks})
+
+    if verbose:
+        print("[SEQ/ASSEMBLY] evidence placed: frames=%d door=%d load=%d "
+              "damage=%d  (copied from camera-local snapshots; no decode)"
+              % (counts["frames"], counts["door"], counts["load"],
+                 counts["damage"]))
+    return counts
+
+
+# -----------------------------------------------------------------------------
 # Public entry
 # -----------------------------------------------------------------------------
 
@@ -665,16 +821,20 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
 
     states_root = os.path.join(workspace, "wagon_states")
     counts = {"door": 0, "damage": 0, "load": 0}
+    door_payloads: Dict[str, Dict[str, Any]] = {}
+    damage_payloads: Dict[str, Dict[str, Any]] = {}
     for wagon in state.wagons:
         features = assigned.get(wagon.global_id) or {}
         payloads = []
         if features.get("door"):
-            payloads.append(_aggregate_door(wagon.global_id, features["door"],
-                                            frame_size))
+            door_payloads[wagon.global_id] = _aggregate_door(
+                wagon.global_id, features["door"], frame_size)
+            payloads.append(door_payloads[wagon.global_id])
             counts["door"] += 1
         if features.get("damage"):
-            payloads.append(_aggregate_damage(wagon.global_id,
-                                              features["damage"], frame_size))
+            damage_payloads[wagon.global_id] = _aggregate_damage(
+                wagon.global_id, features["damage"], frame_size)
+            payloads.append(damage_payloads[wagon.global_id])
             counts["damage"] += 1
         if features.get("load"):
             payloads.append(_aggregate_load(wagon.global_id, features["load"]))
@@ -692,15 +852,45 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
 
     # ---- fusion + the single combined report (Batch's own stages) --------
     from fusion import wagon_state_builder
-    from reporting import combined_train_report
+    from reporting import camera_reports, combined_train_report
 
     unified = wagon_state_builder.build(
         state=state, wagon_states_root=states_root, verbose=verbose)
 
+    # Place the camera-local snapshots into the per-wagon layout the VALIDATED
+    # camera report reads. Copies only -- the frames were captured during each
+    # camera's single decode.
+    evidence_root = os.path.join(workspace, "evidence")
+    cache_root = os.path.join(workspace, "wagon_cache")
+    place_wagon_evidence(
+        state=state, evidences=usable, assigned=assigned,
+        door_payloads=door_payloads, damage_payloads=damage_payloads,
+        evidence_root=evidence_root, cache_root=cache_root, verbose=verbose)
+
     output_dir = ev.combined_dir(workspace)
+
+    # ---- Stage 5a: the VALIDATED per-camera reports ----------------------
+    # Exactly the renderer, filenames and fused facts Batch produces; the only
+    # difference is which architecture computed the state it is given.
+    camera_report_paths: Dict[str, Optional[str]] = {}
+    try:
+        camera_report_paths = camera_reports.build_all(
+            state=state, unified=unified, evidence_root=evidence_root,
+            wagon_states_root=states_root, cache_root=cache_root,
+            per_camera_tracking_path=tracking_path,
+            output_dir=output_dir, batch_key=batch_key, verbose=verbose)
+    except Exception as exc:                                # pragma: no cover
+        print("[SEQ/ASSEMBLY] validated camera reports FAILED: %s" % exc,
+              file=__import__("sys").stderr)
+
+    # ---- Stage 5b: the single combined report ----------------------------
     report = combined_train_report.build(
         state=state, unified=unified, output_dir=output_dir,
-        batch_key=batch_key, wagon_states_root=states_root, verbose=verbose)
+        batch_key=batch_key, evidence_root=evidence_root,
+        wagon_states_root=states_root, cache_root=cache_root,
+        camera_pdf_urls={cam: os.path.basename(path)
+                         for cam, path in camera_report_paths.items() if path},
+        verbose=verbose)
 
     diagnostics = {
         "schema": ASSEMBLY_SCHEMA,
@@ -725,4 +915,6 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
         cameras_missing=missing, global_gap_count=state.global_gap_count,
         global_wagon_count=state.total_wagons, state_json_path=state_path,
         report_json_path=report.get("json_path"),
-        report_pdf_path=report.get("pdf_path"), diagnostics=diagnostics)
+        report_pdf_path=report.get("pdf_path"),
+        camera_report_paths=dict(camera_report_paths),
+        diagnostics=diagnostics)

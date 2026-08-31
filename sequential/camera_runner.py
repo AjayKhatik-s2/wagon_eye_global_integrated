@@ -173,6 +173,72 @@ def _model_fingerprints(camera_id: str, *, recon_models_dir: str,
     return out
 
 
+# Snapshots are kept per (feature, state, frame bucket) rather than per frame:
+# one bucket per this many frames keeps the count bounded (a 4000-frame camera
+# yields ~33 buckets) while still giving every wagon window -- typically a few
+# hundred frames -- several candidates to choose from.
+SNAPSHOT_BUCKET_FRAMES = 120
+PLAIN_FRAME_FEATURE = "frames"
+
+
+def snapshot_bucket(frame_idx: int) -> int:
+    return int(frame_idx) // SNAPSHOT_BUCKET_FRAMES
+
+
+class SnapshotStore:
+    """Keeps the best-scoring real frame per (feature, state, bucket) on disk.
+
+    Written during the ONE decode, straight to disk, overwriting only when a
+    better-scoring observation appears in the same bucket -- so memory stays
+    flat and the frame that survives is the one Batch's own snapshot_score
+    would have preferred.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+        self._best: Dict[tuple, float] = {}
+        self.index: Dict[str, str] = {}
+
+    def _relative(self, *parts: str) -> str:
+        return "/".join(parts)
+
+    def consider(self, *, feature: str, state: str, frame_idx: int,
+                 frame, bbox, score: float, label: str) -> None:
+        from features._evidence import draw_annotated_bbox, save_jpeg
+
+        bucket = snapshot_bucket(frame_idx)
+        key = (feature, state, bucket)
+        if score <= self._best.get(key, -1.0):
+            return
+        relative = self._relative(feature, state or "any", "b%04d.jpg" % bucket)
+        target = os.path.join(self.root, *relative.split("/"))
+        image = frame
+        if bbox:
+            try:
+                image = draw_annotated_bbox(frame, list(bbox), label=label,
+                                           color=(0, 255, 255))
+            except Exception:
+                image = frame
+        if save_jpeg(target, image):
+            self._best[key] = float(score)
+            self.index[relative] = target
+
+    def consider_plain(self, *, frame_idx: int, frame) -> None:
+        """One unannotated frame per bucket, for per-wagon visibility."""
+        from features._evidence import save_jpeg
+
+        bucket = snapshot_bucket(frame_idx)
+        key = (PLAIN_FRAME_FEATURE, "", bucket)
+        if key in self._best:
+            return
+        relative = self._relative(PLAIN_FRAME_FEATURE,
+                                  "f%06d.jpg" % int(frame_idx))
+        target = os.path.join(self.root, *relative.split("/"))
+        if save_jpeg(target, frame):
+            self._best[key] = 0.0
+            self.index[relative] = target
+
+
 # -----------------------------------------------------------------------------
 # The single decode
 # -----------------------------------------------------------------------------
@@ -195,6 +261,7 @@ class _DecodeOutput:
 def _decode_once(
     *, camera_id: str, video_path: str, engine, feature_models: Dict[str, Any],
     strides: Dict[str, int], verbose: bool,
+    snapshots: Optional["SnapshotStore"] = None,
 ) -> _DecodeOutput:
     """Open the video ONCE and feed every consumer from the same frame."""
     import cv2
@@ -261,9 +328,23 @@ def _decode_once(
                 stride = max(1, int(strides.get(name, 1)))
                 if frame_index % stride:
                     continue
-                out.observations.extend(_observe(
-                    name, model, frame, frame_index, timestamp,
-                    out.width, out.height))
+                found = _observe(name, model, frame, frame_index, timestamp,
+                                 out.width, out.height)
+                out.observations.extend(found)
+                if snapshots is not None:
+                    for observation in found:
+                        snapshots.consider(
+                            feature=observation.feature,
+                            state=observation.raw_class,
+                            frame_idx=observation.frame_idx, frame=frame,
+                            bbox=observation.bbox, score=observation.score,
+                            label="%s %.2f" % (observation.raw_class,
+                                               observation.confidence))
+
+            # One plain frame per bucket, so a wagon's visibility on this
+            # camera can be shown from a REAL frame rather than assumed.
+            if snapshots is not None:
+                snapshots.consider_plain(frame_idx=frame_index, frame=frame)
 
             frame_index += 1
             if frame_limit and frame_index >= frame_limit:
@@ -645,10 +726,14 @@ def process_camera(
                 "DEVICE_YOLO": __import__("runtime").DEVICE_YOLO,
             }
 
+            snapshot_store = SnapshotStore(
+                os.path.join(ev.camera_evidence_dir(workspace, camera_id),
+                             "snapshots"))
             capture_released = False
             decoded = _decode_once(
                 camera_id=camera_id, video_path=video_path, engine=engine,
-                feature_models=feature_models, strides=strides, verbose=verbose)
+                feature_models=feature_models, strides=strides,
+                verbose=verbose, snapshots=snapshot_store)
             capture_released = True
 
             final_start, final_end, trim_diagnostics = _wagon_region(
@@ -694,9 +779,11 @@ def process_camera(
             "decode_passes": 1,
             "frame_width": decoded.width,
             "frame_height": decoded.height,
+            "snapshot_bucket_frames": SNAPSHOT_BUCKET_FRAMES,
         },
         feature_config=feature_config,
         diagnostics={"trimming": trim_diagnostics, "gap": gap_diagnostics},
+        snapshots=dict(snapshot_store.index),
     )
 
     evidence_file = ev.write_evidence(workspace, camera_evidence)
