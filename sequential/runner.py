@@ -1,0 +1,143 @@
+"""Sequential mode: camera after camera, then ONE Global Assembly.
+
+    Camera 1 complete -> local JSON/PDF -> seal -> release
+    Camera 2 complete -> local JSON/PDF -> seal -> release
+    ...
+    Global Assembly -> canonical gaps -> canonical roster -> combined JSON/PDF
+
+This is NOT Batch in a loop. Each camera runs a single decode that feeds GAP,
+Door, Damage and Load, persists camera-local evidence carrying no canonical
+wagon id, writes its own report so one available camera is immediately useful,
+seals itself, and releases its models before the next camera starts. Only after
+that does a single Global Assembly turn the evidence into meaning.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence
+
+from core import constants as C
+
+from sequential import camera_runner, evidence as ev, global_assembly
+
+
+@dataclass
+class SequentialOutcome:
+    batch_key: str
+    workspace: str
+    cameras: List[camera_runner.CameraRunResult] = field(default_factory=list)
+    assembly: Optional[global_assembly.AssemblyResult] = None
+    seconds: float = 0.0
+
+    @property
+    def sealed_cameras(self) -> List[str]:
+        return [result.camera_id for result in self.cameras if result.sealed]
+
+    @property
+    def failed_cameras(self) -> List[str]:
+        return [result.camera_id for result in self.cameras if not result.sealed]
+
+
+def camera_order(video_paths: Dict[str, str],
+                 cameras: Sequence[str] = C.ALL_CAMERAS) -> List[str]:
+    """Deterministic processing order from the authoritative configuration.
+
+    `C.ALL_CAMERAS` -- RIGHT_UP, LEFT_UP, RIGHT_UP_TOP, LEFT_UP_TOP -- never
+    filesystem order, so two runs on the same inputs process in the same order.
+    """
+    return [camera_id for camera_id in cameras if camera_id in video_paths]
+
+
+def run_sequential(
+    *,
+    video_paths: Dict[str, str],
+    workspace: str,
+    repo_root: str,
+    recon_models_dir: str,
+    feat_models_dir: str,
+    features: Sequence[str],
+    batch_key: str,
+    engine_dir: Optional[str] = None,
+    door_stride: int = 3,
+    damage_stride: int = 3,
+    load_stride: int = 2,
+    force_cameras: bool = False,
+    skip_assembly: bool = False,
+    verbose: bool = True,
+) -> SequentialOutcome:
+    started = time.time()
+    order = camera_order(video_paths)
+    outcome = SequentialOutcome(batch_key=batch_key, workspace=workspace)
+
+    if verbose:
+        print("=" * 78)
+        print("  SEQUENTIAL  batch=%s" % batch_key)
+        print("=" * 78)
+        print("[SEQ] camera order    : %s" % ", ".join(order))
+        absent = [c for c in C.ALL_CAMERAS if c not in order]
+        if absent:
+            print("[SEQ] cameras absent  : %s  (each present camera is still "
+                  "processed and reported independently)" % ", ".join(absent))
+        print("[SEQ] features        : %s" % ", ".join(features))
+        print("[SEQ] strides         : door=%d damage=%d load=%d"
+              % (door_stride, damage_stride, load_stride))
+
+    if not order:
+        if verbose:
+            print("[SEQ] no camera videos found -- nothing to do")
+        outcome.seconds = time.time() - started
+        return outcome
+
+    for camera_id in order:
+        try:
+            result = camera_runner.process_camera(
+                camera_id=camera_id, video_path=video_paths[camera_id],
+                workspace=workspace, repo_root=repo_root,
+                recon_models_dir=recon_models_dir,
+                feat_models_dir=feat_models_dir, features=features,
+                engine_dir=engine_dir, door_stride=door_stride,
+                damage_stride=damage_stride, load_stride=load_stride,
+                force=force_cameras, verbose=verbose, batch_key=batch_key)
+        except Exception as exc:                     # one camera must not
+            import traceback                         # take down the others
+            print("[SEQ] Camera %s FAILED: %s" % (camera_id, exc))
+            traceback.print_exc(limit=4)
+            result = camera_runner.CameraRunResult(
+                camera_id=camera_id, status=ev.STATUS_FAILED, reason=str(exc))
+        outcome.cameras.append(result)
+
+    required = global_assembly.required_cameras()
+    sealed = outcome.sealed_cameras
+    if verbose:
+        if all(camera_id in sealed for camera_id in required):
+            print("[SEQ] ALL REQUIRED CAMERAS SEALED  (%s)" % ", ".join(sealed))
+        else:
+            print("[SEQ] REQUIRED CAMERAS NOT SEALED  sealed=%s required=%s"
+                  % (sealed, list(required)))
+
+    if skip_assembly:
+        if verbose:
+            print("[SEQ] --skip-assembly: camera reports only")
+        outcome.seconds = time.time() - started
+        return outcome
+
+    outcome.assembly = global_assembly.assemble(
+        workspace=workspace, repo_root=repo_root, batch_key=batch_key,
+        engine_dir=engine_dir, verbose=verbose)
+
+    outcome.seconds = time.time() - started
+    if verbose:
+        print("-" * 78)
+        for result in outcome.cameras:
+            print("[SEQ] %-14s %-8s gaps=%-3d observations=%-6d %s"
+                  % (result.camera_id, result.status, result.unique_gap_count,
+                     result.observation_count,
+                     "(resumed)" if result.reused else ""))
+        assembly = outcome.assembly
+        if assembly and assembly.ready:
+            print("[SEQ] combined JSON : %s" % assembly.report_json_path)
+            print("[SEQ] combined PDF  : %s" % assembly.report_pdf_path)
+        print("[SEQ] total %.1fs" % outcome.seconds)
+    return outcome

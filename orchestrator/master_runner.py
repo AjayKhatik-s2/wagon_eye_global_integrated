@@ -82,6 +82,29 @@ FEATURE_MODULES: Dict[str, str] = {
 }
 FEATURES_ALL_KEYWORD = "all"
 
+# -----------------------------------------------------------------------------
+# Execution modes
+# -----------------------------------------------------------------------------
+# Two first-class architectures. Batch is the existing validated pipeline and
+# stays the default, so an existing production command keeps its behaviour.
+# Sequential is camera-independent processing followed by one Global Assembly.
+# This module only SELECTS; neither architecture is duplicated here.
+
+MODE_BATCH = "batch"
+MODE_SEQUENTIAL = "sequential"
+MODES = (MODE_BATCH, MODE_SEQUENTIAL)
+DEFAULT_MODE = MODE_BATCH
+MODE_ENV_VAR = "WAGONEYE_MODE"
+
+
+def resolve_mode(mode: Optional[str] = None) -> str:
+    """`--mode` argument -> $WAGONEYE_MODE -> DEFAULT_MODE."""
+    choice = (mode or os.environ.get(MODE_ENV_VAR) or DEFAULT_MODE).strip().lower()
+    if choice not in MODES:
+        raise ValueError("unknown --mode %r; valid modes are: %s"
+                         % (choice, ", ".join(MODES)))
+    return choice
+
 
 def load_feature_runner(key: str):
     """Import one feature processor on demand and return its `run` callable."""
@@ -829,6 +852,76 @@ def run_auto(*args, **kwargs):
 
 
 # -----------------------------------------------------------------------------
+# Sequential mode (thin selection layer -- the architecture lives in sequential/)
+# -----------------------------------------------------------------------------
+
+def _run_sequential_local(
+    *,
+    video_paths: Dict[str, str],
+    local_inputs: str,
+    batch_key: Optional[str],
+    workspace: Optional[str],
+    recon_models_dir: str,
+    feat_models_dir: str,
+    feature_config: Optional[FeatureConfig],
+    inference_opts: Optional[Dict[str, Any]],
+    global_engine_dir: Optional[str],
+    force_cameras: bool = False,
+    skip_assembly: bool = False,
+) -> int:
+    """Discover inputs, hand them to the Sequential architecture, report."""
+    from sequential import runner as sequential_runner
+
+    if not video_paths:
+        print(f"ERROR: no camera videos found in {local_inputs}",
+              file=sys.stderr)
+        return 2
+
+    batch = build_local_batch(video_paths, batch_key=batch_key)
+    workspace_root = workspace or DEFAULT_WORKSPACE_PARENT
+    batch_workspace = os.path.join(workspace_root, batch.batch_key)
+    os.makedirs(batch_workspace, exist_ok=True)
+
+    config = feature_config or FeatureConfig.all_on()
+    options = inference_opts or {}
+
+    outcome = sequential_runner.run_sequential(
+        video_paths=video_paths,
+        workspace=batch_workspace,
+        repo_root=_REPO_ROOT,
+        recon_models_dir=recon_models_dir,
+        feat_models_dir=feat_models_dir,
+        features=config.enabled_keys(),
+        batch_key=batch.batch_key,
+        engine_dir=global_engine_dir,
+        door_stride=int(options.get("door_sample_stride", 3)),
+        damage_stride=int(options.get("damage_sample_stride", 3)),
+        load_stride=int(options.get("load_sample_stride", 2)),
+        force_cameras=force_cameras,
+        skip_assembly=skip_assembly,
+        verbose=True,
+    )
+
+    for result in outcome.cameras:
+        paths = result.report_paths or {}
+        if paths.get("json_path"):
+            print(f"[LOCAL] {result.camera_id:<13} JSON: {paths['json_path']}")
+        if paths.get("pdf_path"):
+            print(f"[LOCAL] {result.camera_id:<13} PDF : {paths['pdf_path']}")
+
+    assembly = outcome.assembly
+    if assembly is not None and assembly.ready:
+        print(f"[LOCAL] combined JSON: {assembly.report_json_path}")
+        print(f"[LOCAL] combined PDF : {assembly.report_pdf_path}")
+    elif assembly is not None:
+        print(f"[LOCAL] combined report NOT produced: {assembly.reason}")
+
+    if not outcome.sealed_cameras:
+        return 3
+    return 0
+
+
+# -----------------------------------------------------------------------------
 # Local mode
 # -----------------------------------------------------------------------------
 
@@ -843,11 +936,27 @@ def run_local(
     inference_opts: Optional[Dict[str, Any]] = None,
     global_engine_dir: Optional[str] = None,
     stage1_engine: Optional[str] = None,
+    mode: Optional[str] = None,
+    force_cameras: bool = False,
+    skip_assembly: bool = False,
 ) -> int:
     if not os.path.isdir(local_inputs):
         print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
         return 2
     video_paths = scan_local_video_dir(local_inputs)
+
+    if resolve_mode(mode) == MODE_SEQUENTIAL:
+        # Sequential deliberately accepts PARTIAL camera availability: a single
+        # present camera is processed and reported on its own. Batch keeps its
+        # strict all-four requirement below, unchanged.
+        return _run_sequential_local(
+            video_paths=video_paths, local_inputs=local_inputs,
+            batch_key=batch_key, workspace=workspace,
+            recon_models_dir=recon_models_dir, feat_models_dir=feat_models_dir,
+            feature_config=feature_config, inference_opts=inference_opts,
+            global_engine_dir=global_engine_dir,
+            force_cameras=force_cameras, skip_assembly=skip_assembly)
+
     missing = [c for c in C.ALL_CAMERAS if c not in video_paths]
     if missing:
         print(f"ERROR: missing videos for {missing} in {local_inputs}.",
@@ -923,6 +1032,24 @@ def _build_parser() -> argparse.ArgumentParser:
               "entirely and EasyOCR is never initialized.  Fusion and the "
               "reports mark it DISABLED, exactly as --disable-features does."
               % (FEATURES_ALL_KEYWORD, ",".join(FEATURE_KEYS))))
+    p.add_argument(
+        "--mode", default=None, choices=MODES,
+        help=("Execution architecture. '%s' (default) is the existing "
+              "validated pipeline: all four cameras together, global counting, "
+              "then features. '%s' processes each camera independently with a "
+              "single decode per camera, writes that camera's own JSON/PDF "
+              "immediately, seals it and releases its resources, and only then "
+              "builds ONE canonical global train from the persisted evidence. "
+              "Also settable with $%s."
+              % (MODE_BATCH, MODE_SEQUENTIAL, MODE_ENV_VAR)))
+    p.add_argument(
+        "--force-cameras", action="store_true",
+        help=("sequential only: reprocess every camera even when its sealed "
+              "evidence still matches (ignore resume)"))
+    p.add_argument(
+        "--skip-assembly", action="store_true",
+        help=("sequential only: produce the per-camera reports and stop "
+              "before Global Assembly"))
     p.add_argument(
         "--global-engine-dir", default=None, metavar="DIR",
         help=("Path to the validated external global_wagon_app counting engine. "
@@ -1018,6 +1145,13 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
           f"  load={_load_mode}/stride={args.load_sample_stride}")
 
+    try:
+        mode = resolve_mode(args.mode)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(f"[ORCH] Execution mode: {mode.upper()}")
+
     if args.local_only:
         return run_local(
             local_inputs=args.local_inputs,
@@ -1029,6 +1163,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             inference_opts=inference_opts,
             global_engine_dir=args.global_engine_dir,
             stage1_engine=args.stage1_engine,
+            mode=mode,
+            force_cameras=args.force_cameras,
+            skip_assembly=args.skip_assembly,
         )
 
     if not (args.auto or args.once or args.batch):

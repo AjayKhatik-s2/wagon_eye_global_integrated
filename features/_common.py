@@ -80,6 +80,19 @@ def model_class_names(model) -> Dict[int, str]:
 # Frame iteration
 # -----------------------------------------------------------------------------
 
+def clear_yolo_cache() -> int:
+    """Drop every cached YOLO model and return how many were released.
+
+    Batch never calls this: it loads each model once per batch and benefits
+    from the cache. Sequential must release a camera's models before the next
+    camera starts, or processing cameras one at a time would still hold all of
+    their weights resident and the mode would save nothing.
+    """
+    released = len(_MODEL_CACHE)
+    _MODEL_CACHE.clear()
+    return released
+
+
 def wagon_camera_dir(cache_root: str, gw_id: str, camera_id: str) -> str:
     """Path to wagon_cache/<gw>/<camera_folder>/."""
     return os.path.join(cache_root, gw_id, C.CAMERA_FOLDER[camera_id])
