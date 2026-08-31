@@ -130,29 +130,54 @@ def stable_interior(paths: List[str]) -> List[str]:
     return paths[k:len(paths) - k]
 
 
+def frame_index_of(path: str) -> Optional[int]:
+    """The original-video frame index encoded in a cached frame's filename."""
+    try:
+        return int(os.path.basename(path).split("_")[1].split(".")[0])
+    except (IndexError, ValueError):
+        return None
+
+
 def list_wagon_frames(
     cache_root: str, gw_id: str, camera_id: str,
-    *, trim_stable: bool = False,
+    *, trim_stable: bool = False, ownership=None,
 ) -> List[str]:
     """Return sorted JPEG paths for one (gw, camera) pair.
 
     When ``trim_stable`` is True, returns only the adaptive stable interior
     (5% per side, clamped [3, 12]) used for feature inference.
+
+    ``ownership`` is a ``core.wagon_ownership.WagonOwnership``.  When given,
+    frames this wagon does not own are dropped BEFORE the stable interior is
+    taken, so a frame on a global gap boundary is inspected by exactly one of
+    the two adjacent wagons.  Omitted (or a state with no boundaries) leaves the
+    listing exactly as it was.
     """
     d = wagon_camera_dir(cache_root, gw_id, camera_id)
     if not os.path.isdir(d):
         return []
     paths = glob.glob(os.path.join(d, "frame_*.jpg"))
     paths.sort()
+    if ownership is not None and ownership.has_opinion(camera_id):
+        paths = [p for p in paths
+                 if _owned(ownership, gw_id, camera_id, p)]
     if trim_stable:
         paths = stable_interior(paths)
     return paths
 
 
+def _owned(ownership, gw_id: str, camera_id: str, path: str) -> bool:
+    """A frame whose index cannot be read keeps its old behaviour (kept)."""
+    index = frame_index_of(path)
+    if index is None:
+        return True
+    return ownership.owns_camera_frame(gw_id, camera_id, index)
+
+
 def iter_wagon_frames(
     cache_root: str, gw_id: str, camera_id: str,
     *, every_nth: int = 1, max_frames: Optional[int] = None,
-    trim_stable: bool = False,
+    trim_stable: bool = False, ownership=None,
 ) -> Iterator[Tuple[int, np.ndarray]]:
     """Yield (frame_idx, BGR ndarray) in monotonic order.
 
@@ -163,8 +188,11 @@ def iter_wagon_frames(
         trim_stable: iterate only the adaptive stable interior (drop the
             noisy first/last 5% per side, clamped [3, 12]) -- used for
             feature inference, NOT for rendering.
+        ownership: see list_wagon_frames -- restricts iteration to the frames
+            this wagon owns under the global gap timeline.
     """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=trim_stable)
+    paths = list_wagon_frames(cache_root, gw_id, camera_id,
+                              trim_stable=trim_stable, ownership=ownership)
     if every_nth > 1:
         paths = paths[::every_nth]
     if max_frames is not None and len(paths) > max_frames:

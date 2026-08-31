@@ -51,6 +51,7 @@ import cv2
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState, GlobalWagon
+from core import wagon_ownership
 
 
 # -----------------------------------------------------------------------------
@@ -137,6 +138,7 @@ def _extract_one_camera(
     jpeg_quality: int,
     verbose: bool,
     time_offset: float = 0.0,
+    ownership=None,
 ) -> Tuple[str, Dict[str, int]]:
     """Open the video once, walk frames sequentially, dispatch by GW range."""
 
@@ -171,8 +173,15 @@ def _extract_one_camera(
         os.makedirs(dst, exist_ok=True)
         counts[gw.global_id] = 0
         for f in range(sf, ef + 1):
-            # Wagons must not overlap; last-write-wins is a harmless
-            # one-frame seam if they happen to touch.
+            # Adjacent wagons DO touch: a global gap is both the end of one
+            # wagon and the start of the next, so their windows share exactly
+            # one boundary frame.  Ownership of that frame is decided by the
+            # global gap timeline (core/wagon_ownership.py), not by which wagon
+            # happens to be written last -- and it is the same rule the feature
+            # processors apply, so the cache and the features cannot disagree.
+            if ownership is not None and not ownership.owns_camera_frame(
+                    gw.global_id, camera_id, f):
+                continue
             frame_to_target[f] = (gw.global_id, dst)
 
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
@@ -246,12 +255,16 @@ def build(
     count.
     """
     offsets = dict(camera_offsets or {})
+    ownership = wagon_ownership.for_state(state)
     os.makedirs(cache_root, exist_ok=True)
 
     if verbose:
         print(f"[STAGE2] building wagon_cache at {cache_root}")
         print(f"[STAGE2] wagons={len(state.wagons)}  cameras="
               f"{list(video_paths.keys())}")
+        rule = ("global gap timeline (boundary frame -> later wagon)"
+                if ownership is not None else "wagon windows as given")
+        print(f"[STAGE2] frame ownership: {rule}")
 
     result = CacheBuildResult(cache_root=cache_root)
 
@@ -276,6 +289,7 @@ def build(
                     jpeg_quality=jpeg_quality,
                     verbose=verbose,
                     time_offset=float(offsets.get(cam, 0.0) or 0.0),
+                    ownership=ownership,
                 ): cam
                 for (cam, path, fps) in workload
             }
@@ -293,6 +307,7 @@ def build(
                 jpeg_quality=jpeg_quality,
                 verbose=verbose,
                 time_offset=float(offsets.get(cam, 0.0) or 0.0),
+                ownership=ownership,
             )
             for gw_id, n in counts.items():
                 result.frames_written.setdefault(gw_id, {})[cam_id] = n

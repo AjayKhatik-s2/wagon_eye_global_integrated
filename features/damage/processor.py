@@ -53,6 +53,7 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core import wagon_ownership
 
 from features._common import (
     load_yolo, iter_wagon_frames, list_wagon_frames,
@@ -161,6 +162,7 @@ def _run_tracker_one_camera(
     gw_id: str,
     camera_id: str,
     confidence_floor: float,
+    ownership=None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, List[Dict[str, Any]]]:
     """Returns (track_decisions, n_frames_used, frame_w, frame_h, frame_dets).
 
@@ -170,7 +172,8 @@ def _run_tracker_one_camera(
     is exactly what the Stage-4b overlay replays for top cameras (faithful,
     including legacy's deliberately un-smoothed damage-box behaviour).
     """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
+                              ownership=ownership)
     if not paths:
         return [], 0, 0, 0, []
 
@@ -180,7 +183,8 @@ def _run_tracker_one_camera(
     frame_w, frame_h = 0, 0
     used = 0
     frame_dets: List[Dict[str, Any]] = []
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True):
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
+                                       trim_stable=True, ownership=ownership):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1
@@ -261,6 +265,7 @@ def _run_sampled_one_camera(
     camera_id: str,
     confidence_floor: float,
     sample_stride: int = 2,
+    ownership=None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, List[Dict[str, Any]]]:
     """Sampled-frame Damage inference -- EXPERIMENTAL, not the default path.
 
@@ -275,7 +280,8 @@ def _run_sampled_one_camera(
     sampled frames rather than the tracker's absolute hit count, so a lone
     high-confidence false positive cannot mark a wagon damaged.
     """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
+                              ownership=ownership)
     if not paths:
         return [], 0, 0, 0, []
 
@@ -287,7 +293,8 @@ def _run_sampled_one_camera(
     snapshots: Dict[int, Any] = {}
 
     for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
-                                       every_nth=stride, trim_stable=True):
+                                       every_nth=stride, trim_stable=True,
+                                       ownership=ownership):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
             agg = EvidenceAggregator(frame_width=frame_w, frame_height=frame_h,
@@ -464,6 +471,15 @@ def run(
         print(f"[FEAT/damage] running on {len(state.wagons)} wagons "
               f"(legacy DamageTracker + edge-zone + loaded-wagon filter)")
 
+    # One wagon owns any given boundary frame: the global gap timeline decides,
+    # not the order the cache happened to be written in. Shared by every feature
+    # (core/wagon_ownership.py); None for a roster without gap boundaries, which
+    # leaves frame selection exactly as it was.
+    ownership = wagon_ownership.for_state(state)
+    if verbose and ownership is not None:
+        print(f"[FEAT/damage] wagon ownership: global gap timeline "
+              f"(boundary frame -> later wagon)")
+
     for gw in state.wagons:
         gw_id = gw.global_id
         t0 = time.time()
@@ -505,11 +521,13 @@ def run(
                         yolo_model, tracker_cfg, cache_root, gw_id, cam,
                         confidence_floor=confidence,
                         sample_stride=sample_stride,
+                        ownership=ownership,
                     )
                 else:
                     tracks, used, _, _, fdets = _run_tracker_one_camera(
                         yolo_model, tracker_cfg, cache_root, gw_id, cam,
                         confidence_floor=confidence,
+                        ownership=ownership,
                     )
                 all_frame_dets.extend(fdets)
                 tracks = _dedup_cross_tracks(tracks)

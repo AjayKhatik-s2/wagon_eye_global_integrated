@@ -117,6 +117,74 @@ def _camera_offset_entry(camera, wagons, master_fps: float,
     }
 
 
+def _boundary_frame(interval: Dict[str, Any], *, master_earlier: bool,
+                    ) -> Optional[int]:
+    """One end of a wagon's window on one camera, chosen by master direction.
+
+    `camera_frame_ranges` always stores `start_frame <= end_frame`, so on a
+    REVERSED camera the master-earlier boundary is the numerically LARGER
+    frame. The direction is read from the interval's own flag, never inferred.
+    """
+    start, end = interval.get("start_frame"), interval.get("end_frame")
+    if start is None or end is None:
+        return None
+    low, high = min(start, end), max(start, end)
+    if interval.get("timeline_reversed"):
+        return high if master_earlier else low
+    return low if master_earlier else high
+
+
+def build_global_gap_timeline(result, wagon_documents) -> List[Dict[str, Any]]:
+    """The ordered global gaps, as the boundaries the engine already produced.
+
+    Wagon *k* lies between gap *k-1* and gap *k*, so N wagons are delimited by
+    N+1 gaps: each wagon contributes its opening boundary and the last wagon
+    also contributes the closing one. Nothing is detected, recounted or
+    re-aligned here -- this only republishes the boundaries already present in
+    `camera_frame_ranges` as an explicit, ordered timeline, so wagon ownership
+    has a single source of truth to compare against.
+    """
+    if not wagon_documents:
+        return []
+
+    timeline: List[Dict[str, Any]] = []
+    for index, wagon in enumerate(wagon_documents):
+        timeline.append({
+            "gap_index": index,
+            "normalized_position": wagon["normalized_start_position"],
+            "master_frame": wagon["start_frame_master"],
+            "opens_wagon": wagon["global_id"],
+            "closes_wagon": wagon_documents[index - 1]["global_id"]
+            if index else None,
+            "cameras": {
+                camera_id: {
+                    "frame": _boundary_frame(interval, master_earlier=True),
+                    "status": interval.get("status"),
+                    "timeline_reversed": bool(interval.get("timeline_reversed")),
+                }
+                for camera_id, interval in wagon["camera_frame_ranges"].items()
+            },
+        })
+
+    last = wagon_documents[-1]
+    timeline.append({
+        "gap_index": len(wagon_documents),
+        "normalized_position": last["normalized_end_position"],
+        "master_frame": last["end_frame_master"],
+        "opens_wagon": None,
+        "closes_wagon": last["global_id"],
+        "cameras": {
+            camera_id: {
+                "frame": _boundary_frame(interval, master_earlier=False),
+                "status": interval.get("status"),
+                "timeline_reversed": bool(interval.get("timeline_reversed")),
+            }
+            for camera_id, interval in last["camera_frame_ranges"].items()
+        },
+    })
+    return timeline
+
+
 def build_global_train_state_document(result) -> Dict[str, Any]:
     """The old Stage-1 JSON, built from the harvested engine result."""
     master = result.cameras[result.master_camera]
@@ -254,6 +322,9 @@ def build_global_train_state_document(result) -> Dict[str, Any]:
         "global_counting_engine": ENGINE_NAME,
         "total_wagons": len(wagon_documents),
         "wagons": wagon_documents,
+        # The ordered global gap timeline: the authority for wagon ownership of
+        # feature events (see core/wagon_ownership.py).
+        "global_gaps": build_global_gap_timeline(result, wagon_documents),
         "master_camera": result.master_camera,
         "master_fps": master_fps,
         "master_total_frames": master.total_frames,

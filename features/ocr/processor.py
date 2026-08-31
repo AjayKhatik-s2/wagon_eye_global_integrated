@@ -40,6 +40,7 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core import wagon_ownership
 
 from features._common import (
     load_yolo, run_detection, iter_wagon_frames, crop_bbox,
@@ -95,6 +96,7 @@ def _process_one_wagon(
     cache_root: str,
     gw_id: str,
     det_confidence: float,
+    ownership=None,
 ) -> Dict[str, Any]:
     """Iterate cached RIGHT_UP frames, run YOLO + OCR, aggregate."""
     aggregator = WagonNumberAggregator(AggregatorConfig(
@@ -107,7 +109,8 @@ def _process_one_wagon(
     raw_candidates: List[Dict[str, Any]] = []
     best = BestFrameTracker()    # remembers the highest-conf OCR snapshot
 
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP,
+                                       trim_stable=True, ownership=ownership):
         used += 1
 
         # Stage A: YOLO detection -- locate wagon-number bbox regions
@@ -211,6 +214,11 @@ def run(
         print(f"[FEAT/ocr] running on {len(state.wagons)} wagons "
               f"(legacy WagonNumberOCR + WagonNumberAggregator, RIGHT_UP only)")
 
+    # One wagon owns any given boundary frame: the global gap timeline decides
+    # (core/wagon_ownership.py), shared by every feature. None for a roster
+    # without gap boundaries, which leaves frame selection exactly as it was.
+    ownership = wagon_ownership.for_state(state)
+
     for gw in state.wagons:
         gw_id = gw.global_id
         t0 = time.time()
@@ -245,6 +253,7 @@ def run(
 
             outcome = _process_one_wagon(
                 yolo_model, ocr, cache_root, gw_id, det_confidence,
+                ownership=ownership,
             )
             used = outcome["frame_count"]
             aggregated = outcome["aggregated"]

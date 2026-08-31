@@ -65,6 +65,7 @@ import numpy as np
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core import wagon_ownership
 from core.frame_quality import (
     detection_quality, snapshot_score, expand_bbox, _DOOR_BBOX_EXPAND_FRAC,
 )
@@ -129,6 +130,7 @@ def _run_tracker_one_camera(
     cache_root: str,
     gw_id: str,
     camera_id: str,
+    ownership=None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"]]:
     """Run the full per-camera door pipeline on one wagon.
 
@@ -143,7 +145,8 @@ def _run_tracker_one_camera(
     persisted snapshot actually shows that (often anomalous) state, falling
     back to the globally best-scored frame when no such frame exists.
     """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
+                              ownership=ownership)
     if not paths:
         return [], 0, 0, 0, {}, {"tracks": [], "events": []}
 
@@ -217,7 +220,7 @@ def _run_tracker_one_camera(
     # wagons LEFT_UP lost its track entirely and fell back to CLOSED/0.000 --
     # re-breaking exactly what removing the geometric prior had recovered.
     for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
-                                       trim_stable=True):
+                                       trim_stable=True, ownership=ownership):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1
@@ -408,6 +411,7 @@ def _run_sampled_one_camera(
     gw_id: str,
     camera_id: str,
     sample_stride: int = 2,
+    ownership=None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"],
            Dict[str, Any]]:
     """Sampled-frame Door inference -- EXPERIMENTAL, not the default path.
@@ -429,7 +433,8 @@ def _run_sampled_one_camera(
     `_canonical()` bucket-key quirk.  Replicating that quirk keeps the A/B
     comparison clean; fixing it here would conflate two changes.
     """
-    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True,
+                              ownership=ownership)
     if not paths:
         return [], 0, 0, 0, {}, {"tracks": [], "events": []}
 
@@ -444,7 +449,8 @@ def _run_sampled_one_camera(
     trajectory: Dict[int, Dict[str, Any]] = {}
 
     for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
-                                       every_nth=stride, trim_stable=True):
+                                       every_nth=stride, trim_stable=True,
+                                       ownership=ownership):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
             agg = EvidenceAggregator(frame_width=frame_w, frame_height=frame_h,
@@ -649,6 +655,11 @@ def run(
               f"(conf>={confidence}, legacy DoorTracker + IdentityMerger + "
               f"GeometricPrior + IlluminationQuality)")
 
+    # One wagon owns any given boundary frame: the global gap timeline decides
+    # (core/wagon_ownership.py), shared by every feature. None for a roster
+    # without gap boundaries, which leaves frame selection exactly as it was.
+    ownership = wagon_ownership.for_state(state)
+
     for gw in state.wagons:
         gw_id = gw.global_id
         t0 = time.time()
@@ -670,9 +681,11 @@ def run(
                     return _run_sampled_one_camera(
                         yolo_model, tracker_cfg, cache_root, gw_id, cam,
                         sample_stride=sample_stride,
+                        ownership=ownership,
                     )
                 return _run_tracker_one_camera(
                     yolo_model, tracker_cfg, merger_cfg, cache_root, gw_id, cam,
+                    ownership=ownership,
                 )
 
             l_decisions, l_used, _, _, l_cands, l_overlay = _one_camera(C.CAMERA_LEFT_UP)

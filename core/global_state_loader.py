@@ -123,6 +123,13 @@ class GlobalTrainState:
     support_alignment_summary: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     invariant_checks: Dict[str, Any] = field(default_factory=dict)
     global_gap_count: int = 0
+    # ---- additive: the ordered global gap timeline ------------------------
+    # `[{gap_index, normalized_position, master_frame, cameras:{cam:{frame}}}]`
+    # in master order.  N wagons are delimited by N+1 gaps.  This is what
+    # `core.wagon_ownership` compares an event against so that exactly one
+    # wagon owns it; empty for a counter that emits no gap timeline, in which
+    # case ownership falls back to the aligned wagon windows.
+    global_gaps: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Coerce the roster to a tuple no matter how it was constructed, so the
@@ -346,6 +353,8 @@ def parse_global_train_state(doc: Dict[str, Any]) -> GlobalTrainState:
         support_alignment_summary=dict(doc.get("support_alignment_summary") or {}),
         invariant_checks=invariants,
         global_gap_count=gap_count,
+        global_gaps=[dict(gap) for gap in (doc.get("global_gaps") or ())
+                     if isinstance(gap, Mapping)],
     )
 
 

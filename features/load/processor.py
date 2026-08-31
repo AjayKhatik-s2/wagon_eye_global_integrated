@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
+from core import wagon_ownership
 
 from features._common import (
     load_yolo, run_classification, iter_wagon_frames,
@@ -66,7 +67,7 @@ def _canonical_load(raw: str) -> str:
 
 def _aggregate_camera(
     model, cache_root: str, gw_id: str, camera_id: str,
-    *, every_nth: int, max_frames: Optional[int],
+    *, every_nth: int, max_frames: Optional[int], ownership=None,
 ) -> Tuple[str, float, int, int, int, "BestFrameTracker", "BestFrameTracker"]:
     """Return (load_status, confidence, frames_used, loaded_count, empty_count,
                best_loaded_frame, best_empty_frame).
@@ -88,7 +89,8 @@ def _aggregate_camera(
     for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
                                        every_nth=every_nth,
                                        max_frames=max_frames,
-                                       trim_stable=True):
+                                       trim_stable=True,
+                                       ownership=ownership):
         cls, conf = run_classification(model, frame)
         cls_canon = _canonical_load(cls)
         used += 1
@@ -168,6 +170,11 @@ def run(
         print(f"[FEAT/load] running on {len(state.wagons)} wagons "
               f"(legacy frame-by-frame voting, >{_LOADED_RATIO_THRESHOLD:.0%} -> LOADED)")
 
+    # One wagon owns any given boundary frame: the global gap timeline decides
+    # (core/wagon_ownership.py), shared by every feature. None for a roster
+    # without gap boundaries, which leaves frame selection exactly as it was.
+    ownership = wagon_ownership.for_state(state)
+
     for gw in state.wagons:
         gw_id = gw.global_id
         t0 = time.time()
@@ -201,6 +208,7 @@ def run(
                 cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
                     model, cache_root, gw_id, cam,
                     every_nth=effective_every_nth, max_frames=max_frames,
+                    ownership=ownership,
                 )
                 per_camera[cam] = {
                     "load_status":  cls,
