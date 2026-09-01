@@ -1036,6 +1036,22 @@ def run_local(
 HISTORICAL_DEFAULT_MODE = MODE_SEQUENTIAL
 
 
+def _prod_ingest_endpoints() -> List[str]:
+    """Resolved per-camera ingest endpoints that are NOT the UAT receiver.
+
+    Returns [] when delivery is UAT-only.  Import is function-local so a
+    non-delivering run never pulls the delivery package in.
+    """
+    try:
+        from delivery import dashboard_ingest as D
+        uat = D._uat_url()
+        return [u for u in D.ingest_api_urls() if u != uat]
+    except Exception:                                       # noqa: BLE001
+        # Cannot resolve -> cannot certify UAT-only.  Reported by the caller as
+        # a refusal, because "I could not check" must not read as "it is safe".
+        return ["<could not resolve ingest endpoints>"]
+
+
 def run_historical(args, *, feature_config=None, inference_opts=None,
                    mode: Optional[str] = None) -> int:
     """CLI adapter for `--historical`.
@@ -1077,6 +1093,21 @@ def run_historical(args, *, feature_config=None, inference_opts=None,
     if not C.S3_INPUT_PREFIXES:
         problems.append("WAGONEYE_S3_INPUT_PREFIXES is empty -- historical "
                         "discovery would find nothing")
+    # A historical bulk run reaches every endpoint `ingest_api_urls()` resolves,
+    # once per camera per train -- 52 POSTs for a 13-train day.  That list
+    # defaults to BOTH receivers, PROD first, so a shell that forgot
+    # WAGONEYE_INSPECTION_INGEST_API_URLS=uat silently reprocesses history into
+    # production.  A missing environment variable must not be able to do that:
+    # the operator states the intent with a flag instead.
+    if args.historical_deliver and not args.allow_prod_ingest:
+        prod = _prod_ingest_endpoints()
+        if prod:
+            problems.append(
+                "--historical-deliver resolves to a NON-UAT ingest endpoint:\n"
+                + "".join("        %s\n" % u for u in prod)
+                + "      Set WAGONEYE_INSPECTION_INGEST_API_URLS=uat, or pass\n"
+                  "      --allow-prod-ingest to state that you mean it")
+
     if problems:
         print("[HISTORICAL] refusing to start -- configuration errors:",
               file=sys.stderr)
@@ -1255,6 +1286,14 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="enable S3 upload + dashboard ingest + email for "
                            "historical batches (OFF by default so a re-run "
                            "cannot overwrite or re-notify the live delivery)")
+    hist.add_argument("--allow-prod-ingest", action="store_true",
+                      help="permit --historical-deliver to post to a non-UAT "
+                           "ingest endpoint.  Without this a bulk historical "
+                           "run refuses to start unless delivery is UAT-only, "
+                           "because the endpoint list DEFAULTS to both "
+                           "receivers (PROD first) and a forgotten "
+                           "WAGONEYE_INSPECTION_INGEST_API_URLS=uat would "
+                           "otherwise reprocess history into production")
     hist.add_argument("--manifest-out", default=None,
                       help="path for the JSON manifest (default: "
                            "<workspace>/historical/historical_manifest.json)")
