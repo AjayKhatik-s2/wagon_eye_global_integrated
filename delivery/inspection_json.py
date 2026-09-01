@@ -55,6 +55,7 @@ from core import constants as C
 from core.evidence_identity import (
     damage_track_slot, legacy_damage_track_slot, load_best_frame_slot,
     legacy_load_best_frame_slot, parse_damage_track_slot)
+from core import wagon_frames as _WF
 from core.logging_setup import get_logger
 
 log = get_logger("delivery.inspection_json")
@@ -439,6 +440,50 @@ def _damage_track_owner(evidence_root: str, gw_id: str,
     return None
 
 
+def _own_positional_frames(evidence_root: str, gw_id: str, camera: str,
+                           url_for: Callable[..., Optional[str]]
+                           ) -> List[Dict[str, Any]]:
+    """This camera's OWN start/mid1/mid2/end frames, if they were materialized.
+
+    Stage 4c writes four positional frames per wagon per camera to
+    ``evidence/<GW>/wagon_frames/<angle>/`` (core.wagon_frames). Those are the
+    camera's own footage, sampled from its own local frame range -- so unlike the
+    fused ``load/best_frame.jpg`` there is no ownership question: the ANGLE
+    DIRECTORY is the attribution.
+
+    This exists because a top camera's load/damage gallery can be legitimately
+    EMPTY. Load fuses both top cameras into one verdict and saves a single frame
+    belonging to whichever won (RIGHT_UP_TOP preferred), and damage yields
+    nothing on a clean train -- so LEFT_UP_TOP published no pictures at all while
+    its own four frames per wagon sat in S3 unreferenced.
+
+    Positions are read from the FRAME NUMBER order, which is the order
+    core.wagon_frames wrote them in, so `start` really is the start of the wagon
+    rather than an artifact of insertion order.
+
+    Returns [] when the directory does not exist -- a URL is never fabricated.
+    """
+    angle = _WF.ANGLE_BY_CAMERA.get(camera)
+    if not angle:
+        return []
+    d = os.path.join(evidence_root, gw_id, "wagon_frames", angle)
+    if not os.path.isdir(d):
+        return []
+    try:
+        names = sorted(f for f in os.listdir(d) if f.lower().endswith(".jpg"))
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for name in names[:len(POSITION_NAMES)]:
+        # feature="wagon_frames", camera=angle resolves the nested layout
+        # `<GW>/wagon_frames/<angle>/<file>` and confirms the file exists.
+        url = url_for(gw_id=gw_id, feature="wagon_frames", camera=angle,
+                      filename=name)
+        if url:
+            out.append({"position": POSITION_NAMES[len(out)], "s3_url": url})
+    return out
+
+
 def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
                   flavour: str, url_for: Callable[..., Optional[str]]) -> List[Dict[str, Any]]:
     """``wagon_frames`` for one wagon: ``[{position, s3_url}, ...]``.
@@ -496,6 +541,13 @@ def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
         })
         if len(frames) >= len(POSITION_NAMES):
             break
+    if not frames:
+        # Nothing from load/damage. Fall back to this camera's own positional
+        # frames rather than publishing an empty gallery -- see
+        # `_own_positional_frames`. Deliberately only when the gallery is
+        # EMPTY: a camera that already published load/damage evidence keeps
+        # exactly what it published, so no currently-working camera changes.
+        frames = _own_positional_frames(evidence_root, gw_id, camera, url_for)
     return frames
 
 
