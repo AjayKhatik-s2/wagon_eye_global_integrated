@@ -541,13 +541,39 @@ def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
         })
         if len(frames) >= len(POSITION_NAMES):
             break
-    if not frames:
-        # Nothing from load/damage. Fall back to this camera's own positional
-        # frames rather than publishing an empty gallery -- see
-        # `_own_positional_frames`. Deliberately only when the gallery is
-        # EMPTY: a camera that already published load/damage evidence keeps
-        # exactly what it published, so no currently-working camera changes.
-        frames = _own_positional_frames(evidence_root, gw_id, camera, url_for)
+    if flavour == FLAVOUR_TOP and len(frames) < len(POSITION_NAMES):
+        # PAD a top camera's gallery out to four with its own positional frames.
+        #
+        # Filling an EMPTY gallery is the important half: LEFT_UP_TOP published
+        # nothing at all on a clean train (load's single fused frame belongs to
+        # RIGHT_UP_TOP, and damage yields nothing without damage), so its panel
+        # read NO DATA FOUND.
+        #
+        # Padding a PARTIAL one is the other half. RIGHT_UP_TOP publishes exactly
+        # one frame -- the fused load close-up -- so without this the two top
+        # panels show 4 and 1, which reads as one camera being broken. Both
+        # cameras have four of their own frames per wagon; there is no reason for
+        # one panel to be a quarter full.
+        #
+        # Curated frames are kept FIRST and never displaced: the load close-up is
+        # chosen for judging load state, while positional frames are evenly
+        # spaced samples. `position` is already a slot name rather than a
+        # semantic claim in this schema -- the side cameras publish
+        # `door/left_best.jpg` as "start" and `left_crop.jpg` as "mid1" -- so
+        # appending does not misdescribe anything.
+        #
+        # Side cameras are deliberately untouched: their galleries are what the
+        # dashboard has always shown, and nothing about them is broken.
+        have = {f["s3_url"] for f in frames}
+        for extra in _own_positional_frames(evidence_root, gw_id, camera,
+                                            url_for):
+            if len(frames) >= len(POSITION_NAMES):
+                break
+            if extra["s3_url"] in have:
+                continue
+            frames.append({"position": POSITION_NAMES[len(frames)],
+                           "s3_url": extra["s3_url"]})
+            have.add(extra["s3_url"])
     return frames
 
 

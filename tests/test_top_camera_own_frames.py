@@ -114,3 +114,70 @@ def test_positions_follow_frame_number_not_listing_order(evidence):
     nums = [int(f["s3_url"].rsplit("_", 1)[-1].split(".")[0]) for f in frames]
     assert nums == sorted(nums), "positions are out of frame order: %s" % nums
     assert nums == [430, 445, 460, 475]
+
+
+# -----------------------------------------------------------------------------
+# Padding a PARTIAL top gallery
+# -----------------------------------------------------------------------------
+
+def test_right_up_top_is_padded_to_four(evidence):
+    """RIGHT_UP_TOP published ONE frame; both top panels must show four.
+
+    Without padding the dashboard shows 4 images for LEFT_UP_TOP and 1 for
+    RIGHT_UP_TOP, which reads as one camera being broken. Both have four of their
+    own frames per wagon.
+    """
+    frames = IJ._wagon_frames(evidence, "GW_1", C.CAMERA_RIGHT_UP_TOP,
+                              IJ.FLAVOUR_TOP, _url_for_factory(evidence))
+    assert len(frames) == 4
+    assert [f["position"] for f in frames] == list(IJ.POSITION_NAMES)
+
+
+def test_the_curated_load_frame_stays_first(evidence):
+    """The fused load close-up is chosen for judging load state.
+
+    Padding must APPEND, never displace it -- an evenly spaced sample is not a
+    substitute for the frame the load processor picked.
+    """
+    frames = IJ._wagon_frames(evidence, "GW_1", C.CAMERA_RIGHT_UP_TOP,
+                              IJ.FLAVOUR_TOP, _url_for_factory(evidence))
+    assert "load/best_frame.jpg" in frames[0]["s3_url"]
+    for f in frames[1:]:
+        assert "/wagon_frames/right_top/" in f["s3_url"]
+
+
+def test_padding_never_duplicates_a_frame(evidence):
+    frames = IJ._wagon_frames(evidence, "GW_1", C.CAMERA_RIGHT_UP_TOP,
+                              IJ.FLAVOUR_TOP, _url_for_factory(evidence))
+    urls = [f["s3_url"] for f in frames]
+    assert len(urls) == len(set(urls))
+
+
+def test_padding_keeps_the_two_top_cameras_disjoint(evidence):
+    """Still no borrowing: they photograph the same roof from opposite sides."""
+    url_for = _url_for_factory(evidence)
+    left = {f["s3_url"] for f in IJ._wagon_frames(
+        evidence, "GW_1", C.CAMERA_LEFT_UP_TOP, IJ.FLAVOUR_TOP, url_for)}
+    right = {f["s3_url"] for f in IJ._wagon_frames(
+        evidence, "GW_1", C.CAMERA_RIGHT_UP_TOP, IJ.FLAVOUR_TOP, url_for)}
+    assert len(left) == len(right) == 4
+    assert not (left & right)
+
+
+def test_side_cameras_are_not_padded(tmp_path):
+    """Side galleries are what the dashboard has always shown -- leave them.
+
+    A side camera with two door frames keeps two, even though positional frames
+    exist for it: nothing about the side panels is broken, and changing them
+    would be an unrequested visual change to a working view.
+    """
+    root = tmp_path / "evidence"
+    for name in ("left_best.jpg", "left_crop.jpg"):
+        _write(str(root / "GW_1" / "door" / name))
+    for n in (350, 364, 378, 392):
+        _write(str(root / "GW_1" / "wagon_frames" / "left_up"
+                   / ("w1_frame_%06d.jpg" % n)))
+    frames = IJ._wagon_frames(str(root), "GW_1", C.CAMERA_LEFT_UP,
+                              IJ.FLAVOUR_SIDE, _url_for_factory(str(root)))
+    assert len(frames) == 2
+    assert all("/door/" in f["s3_url"] for f in frames)
