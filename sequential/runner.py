@@ -226,6 +226,7 @@ def run_sequential(
     features: Sequence[str],
     batch_key: str,
     engine_dir: Optional[str] = None,
+    source_video_urls: Optional[Dict[str, str]] = None,
     door_stride: int = 3,
     damage_stride: int = 3,
     load_stride: int = 2,
@@ -344,6 +345,7 @@ def run_sequential(
         workspace=workspace, repo_root=repo_root, batch_key=batch_key,
         engine_dir=engine_dir, feat_models_dir=feat_models_dir,
         features=features, evidence_url_base=evidence_url_base,
+        source_video_urls=source_video_urls,
         inference_opts={
             "door_inference_mode": door_inference_mode,
             "door_sample_stride": door_stride,

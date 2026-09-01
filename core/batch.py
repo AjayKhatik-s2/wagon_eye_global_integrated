@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from . import constants as C
+from .config import IST  # canonical +05:30; config.py imports no repo modules
 
 
 # -----------------------------------------------------------------------------
@@ -31,6 +32,8 @@ class CameraVideo:
     train_timestamp: str        # YYYYMMDD_HHMMSS
     file_size: int = 0
     last_modified: Optional[datetime] = None
+    etag: str = ""              # S3 ETag; "" for local files.  Used to detect a
+                                # clip that was re-uploaded under the same key.
 
 
 # -----------------------------------------------------------------------------
@@ -53,12 +56,20 @@ class TrainBatch:
         return not self.missing_cameras()
 
     def age_seconds(self) -> float:
-        """Seconds since the batch's train_timestamp (UTC)."""
+        """Seconds since the batch's train_timestamp.
+
+        The `YYYYMMDD_HHMMSS` digits in a clip filename are IST WALL CLOCK -- the
+        site rig stamps local time with no offset in the name.  Reading them as
+        UTC (which is what a naive `replace(tzinfo=utc)` does) makes every batch
+        look 5h30m YOUNGER than it is, so on a UTC box an age-based settle gate
+        either never fires or fires on the wrong clips.  Anchor to IST instead;
+        the arithmetic is then correct regardless of the host's timezone.
+        """
         try:
             t = datetime.strptime(self.train_timestamp, "%Y%m%d_%H%M%S")
-            t = t.replace(tzinfo=timezone.utc)
         except ValueError:
             return 0.0
+        t = t.replace(tzinfo=IST)
         return (datetime.now(timezone.utc) - t).total_seconds()
 
 

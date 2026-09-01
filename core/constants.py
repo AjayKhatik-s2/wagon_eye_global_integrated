@@ -220,8 +220,37 @@ CAMERA_S3_FOLDER = {
     CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
 }
 
-#: Reverse lookup: S3 folder -> camera id.
+#: Reverse lookup: S3 folder -> camera id.  The FOLDER is authoritative, because
+#: the rig writes it; a filename is whatever the uploader felt like.
 S3_FOLDER_TO_CAMERA = {v: k for k, v in CAMERA_S3_FOLDER.items()}
+
+#: Filename tokens that identify a camera, for keys whose folder is unknown.
+#: DERIVED from CAMERA_FILENAME_ALIASES so the alias map stays the single source
+#: of truth -- a second hand-written table drifts the moment someone edits one.
+CAMERA_FILENAME_TOKENS = {
+    alias.lower(): cam
+    for cam in ALL_CAMERAS
+    for alias in CAMERA_FILENAME_ALIASES.get(cam, (cam,))
+}
+
+
+def camera_from_key(key: str):
+    """Resolve a camera id from an S3 key (or a bare filename).  None if unknown.
+
+    Folder first (the rig writes it), then filename tokens.  Shared by S3
+    discovery and the local-directory scan so the two cannot disagree.
+    """
+    if not key:
+        return None
+    k = key.replace("\\", "/")
+    for folder, cam in S3_FOLDER_TO_CAMERA.items():
+        if f"/{folder}/" in f"/{k}" or k.startswith(f"{folder}/"):
+            return cam
+    base = k.rsplit("/", 1)[-1].lower()
+    for token in sorted(CAMERA_FILENAME_TOKENS, key=len, reverse=True):
+        if token in base:
+            return CAMERA_FILENAME_TOKENS[token]
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -249,6 +278,26 @@ S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY",
 # old account.  Derived, it moves with the account by construction.  The RECEIVER
 # must have read access to whichever bucket this resolves to.
 S3_ARTIFACT_BUCKET = _env("WAGONEYE_ARTIFACT_BUCKET", S3_OUTPUT_BUCKET)
+
+# Raw CCTV.  Declared for operator-facing summaries: this package is a pure
+# CONSUMER of already-trimmed clips (extraction lives in a separate service), so
+# nothing here reads raw video.
+S3_RAW_VIDEO_BUCKET = _env("WAGONEYE_S3_RAW_VIDEO_BUCKET",
+                           "biputri-wagoneye-raw-video")
+
+# Trimmed per-camera train clips -- what historical discovery consumes.
+# Defaulting the consumer to the trimmed bucket (not the report bucket) is what
+# makes discovery find videos with no env file at all.
+S3_TRIMMED_VIDEO_BUCKET = _env("WAGONEYE_S3_TRIMMED_VIDEO_BUCKET",
+                               "biputri-wagoneye-pre-processed-video")
+S3_INPUT_BUCKET = _env("WAGONEYE_S3_INPUT_BUCKET", S3_TRIMMED_VIDEO_BUCKET)
+
+# Prefixes discovery scans -- the four camera folders, matching the trimmed
+# bucket layout the extractor writes.
+S3_INPUT_PREFIXES = _env_list(
+    "WAGONEYE_S3_INPUT_PREFIXES",
+    [CAMERA_S3_FOLDER[c] for c in ALL_CAMERAS],
+)
 
 # -----------------------------------------------------------------------------
 # Dashboard ingest endpoints.  Both hosts serve the SAME path -- the `version`

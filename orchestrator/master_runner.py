@@ -1024,6 +1024,101 @@ def run_local(
 # CLI
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# Historical mode
+# -----------------------------------------------------------------------------
+#
+# Historical mode defaults to SEQUENTIAL, unlike the live paths (whose default
+# is DEFAULT_MODE = batch).  A historical re-run exists to reprocess footage
+# through this repository's sequential architecture; defaulting it to batch would
+# make the common invocation silently run the pipeline the operator did not ask
+# for.  `--mode batch` is still honoured.
+HISTORICAL_DEFAULT_MODE = MODE_SEQUENTIAL
+
+
+def run_historical(args, *, feature_config=None, inference_opts=None,
+                   mode: Optional[str] = None) -> int:
+    """CLI adapter for `--historical`.
+
+    Resolves the requested window, opens an S3 client, and delegates to
+    `historical_runner.run`, which selects the matching already-trimmed clips and
+    feeds each discovered train to the pipeline named by `mode` -- SEQUENTIAL by
+    default.
+
+    Nothing in `run_auto` is entered: no polling loop, no live discovery cutoff,
+    and `processed_batches.json` is neither read nor written -- so a historical
+    run can neither be blocked by a live batch nor mark one terminal.
+    """
+    from core.logging_setup import setup_logging
+    from orchestrator import historical_runner as HR
+    from orchestrator import train_batch_manager as TBM
+
+    # Without this the whole manifest a --dry-run exists to show is logged into
+    # a root logger with no handlers, and the command prints nothing at all.
+    setup_logging()
+
+    # The requested window is parsed FIRST: it is pure and instant, so a typo in
+    # --date / --start-time is reported immediately rather than after a
+    # multi-second S3 round trip.
+    try:
+        window = HR.resolve_window(
+            date=args.date, start_time=args.start_time, end_time=args.end_time,
+            timezone_name=args.timezone, start_iso=args.start, end_iso=args.end,
+        )
+    except ValueError as e:
+        print(f"[HISTORICAL] {e}", file=sys.stderr)
+        return 2
+
+    # Fail fast on the two settings historical discovery cannot work without,
+    # instead of listing zero objects and reporting "no video matched".
+    problems = []
+    if not C.S3_INPUT_BUCKET:
+        problems.append("WAGONEYE_S3_INPUT_BUCKET is required for --historical")
+    if not C.S3_INPUT_PREFIXES:
+        problems.append("WAGONEYE_S3_INPUT_PREFIXES is empty -- historical "
+                        "discovery would find nothing")
+    if problems:
+        print("[HISTORICAL] refusing to start -- configuration errors:",
+              file=sys.stderr)
+        for problem in problems:
+            print(f"  * {problem}", file=sys.stderr)
+        return 2
+
+    # A --dry-run only lists objects, so it needs a client but never a delivery
+    # path; a delivering run needs a client that can write.  One client either
+    # way -- the distinction is enforced downstream by `deliver`.
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=C.S3_REGION)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HISTORICAL] could not create an S3 client: {e}", file=sys.stderr)
+        return 2
+
+    return HR.run(
+        s3_client=s3,
+        window=window,
+        workspace_root=args.workspace or DEFAULT_WORKSPACE_PARENT,
+        recon_models_dir=args.recon_models_dir or DEFAULT_RECON_MODELS_DIR,
+        feat_models_dir=args.feat_models_dir or DEFAULT_FEAT_MODELS_DIR,
+        feature_config=feature_config,
+        pad_minutes=(HR.DEFAULT_PAD_MINUTES if args.pad_minutes is None
+                     else args.pad_minutes),
+        tolerance_sec=(TBM.DEFAULT_BATCH_TOLERANCE_SEC
+                       if args.tolerance_sec is None else args.tolerance_sec),
+        dry_run=args.dry_run,
+        keep_inputs=args.keep_inputs,
+        deliver=args.historical_deliver,
+        # --historical-deliver turns on upload + dashboard ingest; email stays
+        # separately suppressible with the existing --skip-email, so a bulk
+        # re-run can reach the dashboard without mailing the operators N times.
+        send_email=not args.skip_email,
+        manifest_out=args.manifest_out,
+        inference_opts=inference_opts,
+        mode=mode or HISTORICAL_DEFAULT_MODE,
+        verbose=True,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="orchestrator.master_runner",
@@ -1120,6 +1215,49 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
+    # ---- historical (time-range) mode --------------------------------------
+    # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3 clips
+    # fall in a requested time range, stages them, and hands each resulting
+    # TrainBatch to the SAME pipeline the live path uses.  None of these flags is
+    # read by --auto / --once / --batch / --local-only.
+    #
+    # `--mode` applies: historical mode runs SEQUENTIAL by default here (see
+    # HISTORICAL_DEFAULT_MODE), because that is this repository's reason to
+    # exist; pass `--mode batch` for the batch pipeline instead.
+    hist = p.add_argument_group("historical mode (--historical)")
+    hist.add_argument("--historical", action="store_true",
+                      help="process already-trimmed S3 clips from a time range")
+    hist.add_argument("--date", default=None, help="YYYY-MM-DD")
+    hist.add_argument("--start-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--end-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--timezone", default=None,
+                      help="IANA zone for --date/--start-time/--end-time "
+                           "(default Asia/Kolkata)")
+    hist.add_argument("--start", default=None,
+                      help="ISO-8601 start, e.g. 2026-07-24T07:15:00+05:30 "
+                           "(alternative to --date/--start-time)")
+    hist.add_argument("--end", default=None, help="ISO-8601 end")
+    hist.add_argument("--tolerance-sec", type=int, default=None,
+                      help="seconds between two cameras' clips for them to be "
+                           "the same train (default 120, the live value).  This "
+                           "site stamps RIGHT_UP ~2 min before the other three, "
+                           "so 120 SPLITS real trains -- use --dry-run first "
+                           "and widen (300 works) if batches come out partial")
+    hist.add_argument("--pad-minutes", type=float, default=None,
+                      help="how far past its filename timestamp a clip may still "
+                           "hold its train (default 15)")
+    hist.add_argument("--dry-run", action="store_true",
+                      help="discover + print the manifest; download nothing, "
+                           "run no inference")
+    hist.add_argument("--keep-inputs", action="store_true",
+                      help="keep staged clips after a successful batch")
+    hist.add_argument("--historical-deliver", action="store_true",
+                      help="enable S3 upload + dashboard ingest + email for "
+                           "historical batches (OFF by default so a re-run "
+                           "cannot overwrite or re-notify the live delivery)")
+    hist.add_argument("--manifest-out", default=None,
+                      help="path for the JSON manifest (default: "
+                           "<workspace>/historical/historical_manifest.json)")
     return p
 
 
@@ -1176,6 +1314,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(f"[ORCH] Execution mode: {mode.upper()}")
+
+    if args.historical:
+        # Historical mode's own default is SEQUENTIAL, but an EXPLICIT choice
+        # always wins -- either `--mode` on the command line or $WAGONEYE_MODE in
+        # the environment.  `args.mode is None` and no env var is the only case
+        # that means "the operator did not choose", and that is the case
+        # HISTORICAL_DEFAULT_MODE exists for.  Reusing `mode` here would silently
+        # give every historical run the batch pipeline, since DEFAULT_MODE=batch.
+        chose_explicitly = bool(args.mode or os.environ.get(MODE_ENV_VAR))
+        hist_mode = mode if chose_explicitly else HISTORICAL_DEFAULT_MODE
+        print(f"[ORCH] Historical pipeline mode: {hist_mode.upper()}"
+              f"{'' if chose_explicitly else ' (historical default)'}")
+        return run_historical(
+            args,
+            feature_config=feature_config,
+            inference_opts=inference_opts,
+            mode=hist_mode,
+        )
 
     if args.local_only:
         return run_local(

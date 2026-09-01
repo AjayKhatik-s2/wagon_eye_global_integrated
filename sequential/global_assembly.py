@@ -196,6 +196,7 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
              inference_opts: Optional[Dict[str, Any]] = None,
              cameras: Sequence[str] = C.ALL_CAMERAS,
              evidence_url_base: Optional[str] = None,
+             source_video_urls: Optional[Dict[str, str]] = None,
              verbose: bool = True) -> AssemblyResult:
     """Build the canonical train and every final report, the Batch way."""
     if verbose:
@@ -394,6 +395,14 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
         batch_key=batch_key, evidence_root=evidence_root,
         evidence_url_base=evidence_url_base,
         wagon_frames=wagon_frame_manifest,
+        # Per-camera source clip URLs.  These land in
+        # `train_metadata.source_video_urls`, which is where dashboard_ingest
+        # reads each camera's raw video name FROM -- and it derives that
+        # camera's `upload_timestamp` from that filename.  Omitting them makes
+        # every camera's document fall back to a batch-key-derived name, so all
+        # four get one identical timestamp even though RIGHT_UP is captured
+        # ~2 min before the others.
+        source_video_urls=dict(source_video_urls or {}),
         wagon_states_root=states_root, cache_root=cache_root,
         camera_pdf_urls={camera: os.path.basename(path)
                          for camera, path in camera_report_paths.items()
