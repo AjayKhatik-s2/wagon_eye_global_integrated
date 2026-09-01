@@ -648,6 +648,16 @@ def build_inspection_json(*, camera: str, batch_root: str,
     # +/-7-minute rake grouping consumes.
     if batch_key:
         doc["batch_key"] = batch_key
+        # ALSO inside `inspection_data`, at the backend team's request: that is
+        # the object their ingest reads, so a sibling of it is out of reach for
+        # them without a second lookup.
+        #
+        # Both copies carry the SAME shared value and are written from the same
+        # variable one line apart, so they cannot disagree. The top-level key is
+        # kept rather than moved because it is already the published contract --
+        # dropping it would break any reader that has started using it, and a
+        # duplicated scalar costs nothing.
+        doc["inspection_data"]["batch_key"] = batch_key
 
     # Provenance: which global_train run produced this document, and what this
     # camera was authoritative for.  Additive -- never replaces a V4 field.
