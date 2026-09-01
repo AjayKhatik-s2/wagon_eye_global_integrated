@@ -214,16 +214,29 @@ def test_sequential_door_payload_carries_the_same_door_fields_as_batch():
     """The payload Sequential writes must have Batch's door schema."""
     from features.door import processor as door_proc
 
-    sequential_payload = inspect.getsource(global_assembly._aggregate_door)
+    # MIGRATED: `global_assembly._aggregate_door` no longer exists. Sequential
+    # does not build a door payload at all -- Batch's door processor does, on
+    # Batch's wagon cache. So the schema check moves to its real owner, and the
+    # anti-copy check becomes "assembly contains none of these helpers".
+    batch_source = inspect.getsource(door_proc)
     for field in ('"left_door"', '"right_door"', '"doors"', '"door_status"',
                   '"left_door_confidence"', '"right_door_confidence"'):
-        assert field in sequential_payload, (
-            "Sequential's door payload is missing %s" % field)
-    # and it is built with Batch's own helpers, not a copy
+        assert field in batch_source, (
+            "Batch's door payload no longer has %s" % field)
+
     for helper in ("_door_evidence_from_groups", "_pick_side_state",
                    "order_doors", "wagon_door_status"):
-        assert helper in sequential_payload
-        assert hasattr(door_proc, helper)
+        assert hasattr(door_proc, helper), helper
+
+    assembly_source = inspect.getsource(global_assembly)
+    for helper in ("_door_evidence_from_groups", "_pick_side_state"):
+        assert helper not in assembly_source, (
+            "assembly re-implements Batch's %s instead of calling the "
+            "processor" % helper)
+    # the payload is produced by running Batch's processor; see
+    # tests/test_batch_sequential_exact_parity.py for the payload itself
+    assert "load_feature_runner" in inspect.getsource(
+        global_assembly._run_features)
 
 
 # =============================================================================
@@ -246,57 +259,41 @@ def test_visibility_is_answered_from_a_real_frame(tmp_path):
         str(cache_root), "GW_2", C.CAMERA_RIGHT_UP) is False
 
 
-def test_placement_copies_only_and_never_decodes():
-    source = inspect.getsource(global_assembly.place_wagon_evidence)
-    assert "shutil.copyfile" in source
-    for banned in ("VideoCapture", ".predict(", "load_yolo", "imwrite"):
-        assert banned not in source, (
-            "evidence placement must copy existing frames, not create them: %r"
+def test_frames_are_produced_only_by_batchs_materializer():
+    """OBSOLETE AS WRITTEN, replaced by the rule it was approximating.
+
+    `global_assembly.place_wagon_evidence` is gone. Sequential no longer places
+    evidence frames of its own: Batch's Stage-2 materializer writes the per-wagon
+    JPEG-90 cache and Batch's processors write their snapshots from it. Anything
+    else would mean the reports read pixels Batch never produced.
+    """
+    assembly = inspect.getsource(global_assembly)
+    assert "wagon_cache_builder.build" in assembly, (
+        "Batch's materializer must be the one creating cached frames")
+    for banned in ("shutil.copyfile", "cv2.imwrite", "DOOR_SLOT",
+                   "place_wagon_evidence"):
+        assert banned not in assembly, (
+            "assembly is placing or creating evidence frames itself: %s"
             % banned)
 
 
-def test_placement_writes_the_slots_the_validated_report_reads():
-    source = inspect.getsource(global_assembly.place_wagon_evidence)
-    for slot in ("best_frame", "track_%d.jpg", "metadata.json"):
-        assert slot in source, slot
-    # The door slots live in the module-level map the report agrees with.
-    assert global_assembly.DOOR_SLOT == {
-        C.CAMERA_LEFT_UP: "left_best", C.CAMERA_RIGHT_UP: "right_best"}
-    assert "DOOR_SLOT" in source
+def test_snapshot_selection_belongs_to_batchs_processors():
+    """OBSOLETE AS WRITTEN: the 120-frame bucket approximation was removed.
 
-
-def test_camera_stage_persists_snapshots_during_the_single_decode():
+    The camera stage used to keep a best-frame-per-bucket store, which selected
+    DIFFERENT frames than Batch. Batch's processors pick the best frame from the
+    wagon cache, so Sequential now lets them, and the approximation must not
+    come back.
+    """
     from sequential import camera_runner
 
-    source = inspect.getsource(camera_runner._decode_once)
-    assert "snapshots.consider(" in source
-    assert "snapshots.consider_plain(" in source
-    # still exactly one capture
-    body = inspect.getsource(camera_runner._decode_once)
-    assert body.count("cv2.VideoCapture(") == 1
-    assert camera_runner.SNAPSHOT_BUCKET_FRAMES > 0
-
-
-def test_snapshot_store_keeps_only_the_best_per_bucket(tmp_path):
-    import numpy as np
-    from sequential.camera_runner import SnapshotStore, snapshot_bucket
-
-    store = SnapshotStore(str(tmp_path / "snaps"))
-    frame = np.zeros((40, 40, 3), dtype=np.uint8)
-    bbox = [5.0, 5.0, 30.0, 30.0]
-
-    store.consider(feature="door", state="open_door", frame_idx=3, frame=frame,
-                   bbox=bbox, score=0.4, label="a")
-    first = dict(store.index)
-    store.consider(feature="door", state="open_door", frame_idx=7, frame=frame,
-                   bbox=bbox, score=0.9, label="b")
-    store.consider(feature="door", state="open_door", frame_idx=9, frame=frame,
-                   bbox=bbox, score=0.1, label="c")
-
-    # same bucket -> one file, and the best score won
-    assert snapshot_bucket(3) == snapshot_bucket(7) == snapshot_bucket(9)
-    assert len(store.index) == len(first) == 1
-    assert store._best[("door", "open_door", snapshot_bucket(3))] == 0.9
+    module_source = inspect.getsource(camera_runner)
+    for banned in ("SnapshotStore", "snapshot_bucket",
+                   "SNAPSHOT_BUCKET_FRAMES", "consider_plain"):
+        assert banned not in module_source, (
+            "the approximate snapshot selection is back: %s" % banned)
+    assert not hasattr(camera_runner, "SnapshotStore")
+    assert not hasattr(camera_runner, "SNAPSHOT_BUCKET_FRAMES")
 
 
 # =============================================================================

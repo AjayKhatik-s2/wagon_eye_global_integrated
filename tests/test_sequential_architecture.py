@@ -1,14 +1,38 @@
-"""The dual-mode architecture, proved rather than asserted in a comment.
+"""The dual-mode architecture, under the EXACT-PARITY contract.
 
-Batch and Sequential are both first-class. Batch must keep behaving exactly as
-it does today; Sequential must be genuinely camera-independent, with ONE decode
-per camera, evidence persisted before sealing, resources released afterwards,
-and exactly one canonical global roster created later by Global Assembly.
+Batch is the golden reference. Sequential may change execution architecture,
+timing, decode count, intermediate storage and WHEN inference happens -- but for
+the same four videos, models, configuration and feature selection it must
+produce the same canonical output. Three parts of the contract these tests
+enforce changed deliberately, and the obsolete assertions are named here so the
+change is auditable rather than silent:
 
-Everything here runs without weights, videos or the engine: the engine is
-replaced by a stub module set loaded through the REAL `engine_session`, and
-`cv2.VideoCapture` is replaced by a fake that yields synthetic frames. That
-lets the tests count decodes, detector calls and stride hits exactly.
+  OBSOLETE (A) "exactly one decode per camera" / "the one capture is always
+      released" / "GAP receives every decoded frame".
+      The camera stage no longer decodes anything. It calls the ENGINE's own
+      `camera_pipeline.process_camera`, which classifies, trims (writing the
+      re-encoded clip) and detects gaps ON THAT CLIP -- which is the only way
+      the gap input pixels can equal Batch's. Replaced by a STRONGER assertion:
+      `camera_runner` contains no capture, no detector and no tracker at all.
+
+  OBSOLETE (A) "camera feature strides are 3/3/2".
+      Door/Damage/Load inference moved to Global Assembly, because Batch infers
+      them over each wagon's stable interior of JPEG-90 cached frames -- a frame
+      set that cannot exist before the roster does. The strides are still
+      asserted, now where they are actually applied (see
+      test_assembly_runs_batchs_processors_with_batchs_strides), and the
+      behaviour of the sampler is covered by test_sampled_inference_modes.py.
+
+  OBSOLETE (A) "Global Assembly performs no inference and no decode".
+      That was the old `INFERENCE ONCE -> PERSIST -> INTERPRET` rule. Assembly
+      now runs Batch's own materializer and processors, which is the point.
+      Replaced by an assertion that it calls BATCH's implementations rather
+      than mirroring them.
+
+Camera-stage tests drive a stub that implements the ENGINE's process_camera
+contract. Assembly tests drive the REAL engine, which -- as the fixtures in
+tests/_parity_fixtures.py prove -- can execute the entire global phase from
+persisted records with no video and no models.
 
     python -m pytest tests/test_sequential_architecture.py -q
 """
@@ -19,15 +43,17 @@ import json
 import os
 import re
 import sys
-import types
 
 import numpy as np
 import pytest
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_TEST_DIR)
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+for _path in (_REPO_ROOT, _TEST_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+import _parity_fixtures as F
 
 from core import constants as C
 from global_counting import runner as gc_runner
@@ -36,16 +62,24 @@ from sequential import camera_runner, evidence as ev, global_assembly
 from sequential import runner as sequential_runner
 
 
-# =============================================================================
-# Stub engine + stub video
-# =============================================================================
+FPS = F.FPS
+TOTAL_FRAMES = F.TOTAL_FRAMES
+REGION_START = F.REGION_START
+REGION_END = F.REGION_END
+TRIMMED_FRAMES = F.TRIMMED_FRAMES
+GAP_POSITIONS = list(F.CANONICAL_POSITIONS)
 
-FRAME_COUNT = 60
-FPS = 15.0
-WIDTH, HEIGHT = 320, 240
+WIDTH, HEIGHT = 640, 480
 
-# Frames 10..49 classify as WAGON, so the confirmed region is inside the clip.
-WAGON_FROM, WAGON_TO = 10, 49
+REAL_ENGINE = F.real_engine_dir()
+needs_engine = pytest.mark.skipif(
+    REAL_ENGINE is None,
+    reason="the frozen global_wagon_app checkout is not on this machine")
+
+
+# =============================================================================
+# A stub implementing the ENGINE's per-camera contract
+# =============================================================================
 
 STUB_ENGINE = {
 "global_wagon_pipeline.py": "def run(args):\n    return 0\n",
@@ -65,423 +99,156 @@ GAP_MODEL_FILENAMES = {"right": ["right_up_wagon_gap.pt"],
 ''',
 
 "config.py": '''
-BATCH_SIZE = 8
-CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.5
-START_CONFIRMATION_WINDOW = 5
-START_MIN_WAGON_FRAMES = 4
-END_CONFIRMATION_WINDOW = 5
-END_MIN_NON_WAGON_FRAMES = 4
-NON_WAGON_TOLERANCE_FRAMES = 3
-START_PADDING_FRAMES = 2
-END_PADDING_FRAMES = 2
-MAX_FRAMES_TO_PROCESS = 0
-GAP_MAX_FRAMES_TO_PROCESS = 0
-NORMALIZED_TIMELINE_SCALE = 1000.0
-GLOBAL_ALIGNMENT_TOLERANCE = 20.0
 GENERATE_TRIM_DEBUG_VIDEO = True
 GENERATE_GAP_ANNOTATED_VIDEO = True
+NORMALIZED_TIMELINE_SCALE = 1000.0
 _OVERRIDABLE = ("GENERATE_TRIM_DEBUG_VIDEO", "GENERATE_GAP_ANNOTATED_VIDEO")
 
 def apply_overrides(**overrides):
+    applied = {}
     for name, value in overrides.items():
         if value is None:
             continue
         if name not in _OVERRIDABLE:
             raise KeyError(name)
         globals()[name] = value
-    return dict(overrides)
+        applied[name] = value
+    return applied
 ''',
 
-"runtime.py": 'DEVICE = "cpu"\nDEVICE_YOLO = "cpu"\nDEVICE_LABEL = "CPU"\nUSE_HALF = False\n',
+"runtime.py": ('DEVICE = "cpu"\nDEVICE_YOLO = "cpu"\nDEVICE_LABEL = "CPU"\n'
+               'USE_HALF = False\n'),
 
-"classification.py": '''
-import os, json
-def inspect_video(video_path):
-    return {"fps": %(fps)s, "total_frames": %(frames)d,
-            "width": %(width)d, "height": %(height)d, "fourcc": "h264"}
-''' % {"fps": FPS, "frames": FRAME_COUNT, "width": WIDTH, "height": HEIGHT},
+"io_paths.py": '''
+from pathlib import Path
 
-# Records every call so the tests can prove GAP saw EVERY decoded frame.
-"gap_detection.py": '''
-import json, os
-CALLS = []
+VIDEO_PATHS = {}
+OUTPUT_DIR = None
+_NAMES = ("normalized_gap_timelines", "camera_alignment_summary",
+          "global_gap_timeline", "unmatched_extra_detections",
+          "global_wagon_timeline", "global_wagon_snapshots")
 
-def detect_gaps_in_frame(model, frame, class_names, allowed_class_ids):
-    CALLS.append(int(frame[0, 0, 0]))          # frame index is painted in
-    path = os.environ.get("STUB_GAP_CALLS")
-    if path:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(CALLS, handle)
-    index = int(frame[0, 0, 0])
-    # A gap on three frames inside the wagon region -> three unique gaps.
-    if index in (14, 28, 44):
-        return ([{"i": index}], [{"i": index}])
-    return ([], [])
-''',
-
-"gap_tracking.py": '''
-class GapTracker(object):
-    """Confirms one unique gap per distinct detection frame."""
-    def __init__(self):
-        self.seen = []
-        self.finalized = False
-        self.confirmed_unique_gap_count = 0
-
-    def update(self, detections, frame_idx, timestamp):
-        if detections:
-            self.seen.append(int(frame_idx))
-            self.confirmed_unique_gap_count = len(self.seen)
-        return {"newly_confirmed": [], "matched": [], "active_tracks": 0}
-
-    def finalize(self):
-        self.finalized = True
-''',
-
-"camera_pipeline.py": '''
-import pandas as pd
-CAMERA_RESULTS = {}
-
-def build_normalized_gap_timeline(camera, tracker, trimmed_total_frames, fps):
-    denominator = float(max(1, int(trimmed_total_frames) - 1))
-    rows = []
-    for order, frame_idx in enumerate(tracker.seen, start=1):
-        rows.append({
-            "local_gap_id": "%s_G%d" % (camera, order),
-            "confirmation_frame": int(frame_idx),
-            "first_frame": int(frame_idx),
-            "last_frame": int(frame_idx),
-            "normalized_confirmation_time": (frame_idx / denominator) * 1000.0,
-            "max_confidence": 0.9,
-            "average_confidence": 0.85,
-            "frame_count": 1,
-        })
-    return pd.DataFrame(rows)
-''',
-
-"trimming.py": '''
-def find_reliable_wagon_start(is_wagon, cumsum, window, min_wagon_frames):
-    n = len(is_wagon)
-    for end in range(window - 1, n):
-        start = end - window + 1
-        if int(cumsum[end + 1] - cumsum[start]) >= min_wagon_frames:
-            first = next(i for i in range(start, end + 1) if is_wagon[i])
-            return {"detected_start_frame": first, "confirm_frame": end,
-                    "window_start_frame": start,
-                    "wagon_in_window": int(cumsum[end + 1] - cumsum[start])}
-    return None
-
-def find_reliable_wagon_end(is_wagon, start_confirm_frame, detected_start_frame,
-                            end_window, min_non_wagon_frames, tolerance):
-    n = len(is_wagon)
-    last_wagon = int(detected_start_frame)
-    for i in range(int(start_confirm_frame), n):
-        if is_wagon[i]:
-            last_wagon = i
-            continue
-        window = is_wagon[max(0, i - end_window + 1):i + 1]
-        if (len(window) - sum(bool(v) for v in window)) >= min_non_wagon_frames:
-            return {"detected_end_frame": last_wagon, "confirm_frame": i,
-                    "end_candidate_start": i, "end_confirmed": True,
-                    "longest_tolerated_gap": 0}
-    return {"detected_end_frame": last_wagon, "confirm_frame": n - 1,
-            "end_candidate_start": None, "end_confirmed": False,
-            "longest_tolerated_gap": 0}
+def prepare_output_dirs(output_dir):
+    global OUTPUT_DIR
+    OUTPUT_DIR = Path(output_dir)
+    root = OUTPUT_DIR / "global"
+    root.mkdir(parents=True, exist_ok=True)
+    return {name: root / (name + ".csv") for name in _NAMES}
 ''',
 
 # Deliberately named like ours, to keep exercising engine_session isolation.
 "models.py": '''
 CLASSIFICATION_MODELS, GAP_MODELS = {}, {}
 CLASSIFICATION_CLASS_MAPS, GAP_CLASS_MAPS = {}, {}
-
-class _Probs(object):
-    def __init__(self, top1, conf):
-        self.top1 = top1
-        self.top1conf = conf
-
-class _Result(object):
-    def __init__(self, top1, conf):
-        self.probs = _Probs(top1, conf)
-
-class _ClassModel(object):
-    """Class 1 == wagon; frames %d..%d are wagon frames."""
-    def predict(self, frames, **kwargs):
-        batch = frames if isinstance(frames, list) else [frames]
-        out = []
-        for frame in batch:
-            index = int(frame[0, 0, 0])
-            wagon = %d <= index <= %d
-            out.append(_Result(1 if wagon else 0, 0.95))
-        return out
+LOADED_CALLS = []
 
 def load_all_models(classification_paths, gap_paths):
-    """Mirrors the engine, INCLUDING its all-or-nothing validation.
-
-    The real loader checks the WHOLE camera mapping, not the camera in hand, so
-    the stub must too -- otherwise this suite would pass while production
-    raised "Classification model(s) required by the camera mapping are not
-    loaded: ['side']", which is exactly what happened on EC2.
-    """
+    """Mirrors the engine, INCLUDING its all-or-nothing validation."""
     from camera_map import CAMERA_CLASSIFICATION_MODEL, CAMERA_GAP_MODEL
 
+    LOADED_CALLS.append((sorted(classification_paths), sorted(gap_paths)))
     CLASSIFICATION_MODELS.clear(); GAP_MODELS.clear()
     for key, path in classification_paths.items():
-        CLASSIFICATION_MODELS[key] = {"model": _ClassModel(), "imgsz": 224,
-                                      "half": False, "task": "classify",
-                                      "path": path}
+        path.stat()
+        CLASSIFICATION_MODELS[key] = {"path": path, "task": "classify"}
     absent = [k for k in sorted(set(CAMERA_CLASSIFICATION_MODEL.values()))
               if k not in CLASSIFICATION_MODELS]
     if absent:
         raise RuntimeError("Classification model(s) required by the camera "
-                           "mapping are not loaded: %%s" %% absent)
-
+                           "mapping are not loaded: %s" % absent)
     for key, path in gap_paths.items():
-        GAP_MODELS[key] = {"model": object(), "path": path, "task": "detect",
-                           "names": {0: "gap"}}
+        path.stat()
+        GAP_MODELS[key] = {"path": path, "task": "detect"}
     absent = [k for k in sorted(set(CAMERA_GAP_MODEL.values()))
               if k not in GAP_MODELS]
     if absent:
         raise RuntimeError("Gap model(s) required by the camera mapping are "
-                           "not loaded: %%s" %% absent)
+                           "not loaded: %s" % absent)
     return CLASSIFICATION_MODELS, GAP_MODELS
 
 def build_class_maps():
     CLASSIFICATION_CLASS_MAPS.clear(); GAP_CLASS_MAPS.clear()
     for key in CLASSIFICATION_MODELS:
-        CLASSIFICATION_CLASS_MAPS[key] = {
-            "raw": {0: "empty_track", 1: "wagon"},
-            "normalized": {0: "empty_track", 1: "wagon"},
-            "is_wagon": {0: False, 1: True},
-            "wagon_ids": [1]}
+        CLASSIFICATION_CLASS_MAPS[key] = {"raw": {0: "wagon"}}
     for key in GAP_MODELS:
         GAP_CLASS_MAPS[key] = {"raw": {0: "gap"}, "gap_ids": [0]}
-''' % (WAGON_FROM, WAGON_TO, WAGON_FROM, WAGON_TO),
-
-"reporting.py": '''
-def write_normalized_gap_timelines(path): open(str(path), "w").close()
-def write_camera_alignment_summary(path): open(str(path), "w").close()
-def write_global_gap_timeline(path): open(str(path), "w").close()
 ''',
 
-"io_paths.py": "VIDEO_PATHS = {}\nOUTPUT_DIR = None\n",
-"global_alignment.py": """
-import numpy as np
+# The engine's per-camera pipeline: classification + trimming + gap detection
+# ON THE TRIMMED CLIP. The stub returns a result of the SAME SHAPE, and records
+# that it was called, which is what the camera-stage tests assert.
+"camera_pipeline.py": '''
+import json
+import os
+import pandas as pd
+from io_paths import VIDEO_PATHS
 
-NORMALIZED_TIMELINE_SCALE = 1000.0
-GLOBAL_ALIGNMENT_TOLERANCE = 20.0
-ALLOW_TIMELINE_REVERSAL = True
-REVERSAL_MIN_EXTRA_MATCHES = 1
-REVERSAL_MIN_EXTRA_MATCH_RATIO = 0.0
-REVERSAL_MIN_ERROR_IMPROVEMENT = 0.5
+CAMERA_RESULTS = {}
+PROCESSED = []
 
-GAP_TIMELINES = {}
-CAMERA_ALIGNMENTS = {}
-CAMERA_TIMELINE_INFO = {}
-CAMERA_GAP_COUNTS = {}
-MASTER_CAMERA = None
-MASTER_SELECTION_REASON = ""
-MASTER_TIMELINE = None
-MASTER_GAP_COUNT = 0
-MASTER_POSITIONS = None
-MASTER_DURATIONS = None
-MASTER_GAP_ID_LIST = []
-GLOBAL_GAP_IDS = []
-GLOBAL_GAP_COUNT = 0
+FPS = %(fps)r
+TOTAL_FRAMES = %(total)d
+REGION_START, REGION_END = %(start)d, %(end)d
+TRIMMED = REGION_END - REGION_START + 1
+POSITIONS = %(positions)r
 
+def process_camera(camera, force=False):
+    """Same contract as the engine: decodes, trims, detects, records."""
+    if camera not in VIDEO_PATHS:
+        raise KeyError("no video registered for %(pct)sr" %(pct)s camera)
+    PROCESSED.append(camera)
+    marker = os.environ.get("STUB_PROCESS_CALLS")
+    if marker:
+        existing = []
+        if os.path.isfile(marker):
+            existing = json.load(open(marker, encoding="utf-8"))
+        existing.append(camera)
+        json.dump(existing, open(marker, "w", encoding="utf-8"))
 
-def select_master_camera():
-    '''The engine's rule: most confirmed unique gaps, ties by CAMERAS order.'''
-    global MASTER_CAMERA, MASTER_SELECTION_REASON
-    from camera_map import CAMERAS
+    rows = []
+    for index, position in enumerate(POSITIONS, start=1):
+        frame = int(round(position / 1000.0 * (TRIMMED - 1)))
+        rows.append({"camera": camera,
+                     "local_gap_id": "%(pct)ss_G%(pct)sd" %(pct)s (camera, index),
+                     "confirmation_frame": frame,
+                     "first_seen_frame": frame, "last_seen_frame": frame,
+                     "normalized_confirmation_time": float(position),
+                     "normalized_first_time": float(position),
+                     "normalized_last_time": float(position),
+                     "normalized_duration": 8.0, "max_confidence": 0.9,
+                     "average_confidence": 0.85, "frame_count": 3})
+    result = {
+        "camera": camera, "status": "VALID",
+        "video_info": {"fps": FPS, "total_frames": TOTAL_FRAMES,
+                       "width": %(w)d, "height": %(h)d},
+        "trimmed_info": {"fps": FPS, "total_frames": TRIMMED},
+        "final_start_frame": REGION_START, "final_end_frame": REGION_END,
+        "trimmed_total_frames": TRIMMED, "unique_gap_count": len(POSITIONS),
+        "n_frames": TOTAL_FRAMES,
+        "trimmed_video_path": str(VIDEO_PATHS[camera]) + ".trimmed.mp4",
+        "normalized_timeline": pd.DataFrame(rows),
+        "timeline_df": pd.DataFrame(
+            [{"frame_id": i, "normalized_class": "wagon", "is_wagon": True}
+             for i in range(TOTAL_FRAMES)]),
+    }
+    CAMERA_RESULTS[camera] = result
+    return result
+''' % {"fps": FPS, "total": TOTAL_FRAMES, "start": REGION_START,
+       "end": REGION_END, "positions": GAP_POSITIONS, "w": WIDTH, "h": HEIGHT,
+       "pct": "%"},
 
-    CAMERA_GAP_COUNTS.clear()
-    CAMERA_GAP_COUNTS.update(
-        {camera: CAMERA_TIMELINE_INFO[camera]['gap_count']
-         for camera in GAP_TIMELINES})
-    top = max(CAMERA_GAP_COUNTS.values()) if CAMERA_GAP_COUNTS else 0
-    tied = [camera for camera in CAMERAS
-            if CAMERA_GAP_COUNTS.get(camera) == top]
-    MASTER_CAMERA = tied[0] if tied else None
-    MASTER_SELECTION_REASON = 'most confirmed unique gaps (%d)' % top
-    return MASTER_CAMERA
-
-
-def set_master_camera():
-    '''Freeze the master timeline, exactly as the engine does.'''
-    global MASTER_TIMELINE, MASTER_GAP_COUNT, MASTER_POSITIONS
-    global MASTER_DURATIONS, MASTER_GAP_ID_LIST, GLOBAL_GAP_IDS
-    global GLOBAL_GAP_COUNT
-
-    MASTER_TIMELINE = GAP_TIMELINES[MASTER_CAMERA]
-    MASTER_GAP_COUNT = int(len(MASTER_TIMELINE))
-    if MASTER_GAP_COUNT == 0:
-        raise RuntimeError(
-            'Master camera %s produced 0 unique gaps' % MASTER_CAMERA)
-    MASTER_POSITIONS = MASTER_TIMELINE[
-        'normalized_confirmation_time'].to_numpy(dtype=float)
-    MASTER_DURATIONS = MASTER_TIMELINE[
-        'normalized_duration'].to_numpy(dtype=float)
-    MASTER_GAP_ID_LIST = list(MASTER_TIMELINE['local_gap_id'])
-    GLOBAL_GAP_IDS = ['GLOBAL_G%03d' % (index + 1)
-                      for index in range(MASTER_GAP_COUNT)]
-    GLOBAL_GAP_COUNT = MASTER_GAP_COUNT
-
-
-class CameraAlignment(object):
-    def __init__(self, camera, master=None):
-        self.camera = camera
-        self.master = master
-        self.scale = 1.0
-        self.offset = 0.0
-        self.is_reversed = False
-        self.matches = []
-        self.matched_master_indices = set()
-        self.matched_camera_indices = set()
-        self.unmatched_camera_indices = []
-        self.status = "NOT_ESTIMATED"
-        self.fit_note = ""
-        self.n_master = 0
-        self.n_camera = 0
-        self.errors = np.array([])
-
-    def project_to_camera(self, master_position):
-        value = self.scale * float(master_position) + self.offset
-        return NORMALIZED_TIMELINE_SCALE - value if self.is_reversed else value
-
-    def project_to_master(self, camera_position):
-        value = (NORMALIZED_TIMELINE_SCALE - float(camera_position)
-                 if self.is_reversed else float(camera_position))
-        if abs(self.scale) < 1e-12:
-            return float("nan")
-        return (value - self.offset) / self.scale
-
-    @property
-    def matched_count(self):
-        return len(self.matches)
-
-    @property
-    def mean_error(self):
-        return float(np.mean(self.errors)) if self.errors.size else float("inf")
-
-
-def monotonic_gap_match(master_positions, camera_positions, tolerance,
-                        master_durations=None, camera_durations=None,
-                        duration_weight=None):
-    matches, used = [], set()
-    for i, m in enumerate(master_positions):
-        best, best_error = None, None
-        for j, c in enumerate(camera_positions):
-            if j in used:
-                continue
-            error = abs(float(m) - float(c))
-            if error <= tolerance and (best_error is None or error < best_error):
-                best, best_error = j, error
-        if best is not None:
-            used.add(best)
-            matches.append({"master_index": i, "camera_index": best,
-                            "error": best_error, "score": 1.0})
-    return matches
-
-
-def robust_linear_fit(x, y):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if x.size >= 2 and float(np.ptp(x)) > 1e-9:
-        scale, offset = np.polyfit(x, y, 1)
-        return (float(scale), float(offset), int(x.size), "lstsq")
-    return (1.0, 0.0, int(x.size), "identity")
-
-
-def _estimate_one_direction(master_positions, master_durations,
-                            camera_positions, camera_durations):
-    matches = monotonic_gap_match(master_positions, camera_positions,
-                                  GLOBAL_ALIGNMENT_TOLERANCE)
-    scale, offset, note = 1.0, 0.0, "identity"
-    if len(matches) >= 2:
-        scale, offset, _n, note = robust_linear_fit(
-            [master_positions[m["master_index"]] for m in matches],
-            [camera_positions[m["camera_index"]] for m in matches])
-        matches = monotonic_gap_match(
-            scale * np.asarray(master_positions, dtype=float) + offset,
-            camera_positions, GLOBAL_ALIGNMENT_TOLERANCE)
-    return scale, offset, matches, note
-
-
-def estimate_alignment(camera, verbose=True):
-    if camera == MASTER_CAMERA and CAMERA_ALIGNMENTS.get(MASTER_CAMERA):
-        return CAMERA_ALIGNMENTS[MASTER_CAMERA]
-
-    alignment = CameraAlignment(camera, MASTER_CAMERA)
-    frame = GAP_TIMELINES[camera]
-    alignment.n_master = MASTER_GAP_COUNT
-    alignment.n_camera = int(len(frame))
-    if alignment.n_camera == 0:
-        alignment.status = "NO_CAMERA_GAPS"
-        CAMERA_ALIGNMENTS[camera] = alignment
-        return alignment
-
-    positions = frame["normalized_confirmation_time"].to_numpy(dtype=float)
-    durations = frame["normalized_duration"].to_numpy(dtype=float)
-
-    f_scale, f_offset, f_matches, f_note = _estimate_one_direction(
-        MASTER_POSITIONS, MASTER_DURATIONS, positions, durations)
-    f_err = np.array([m["error"] for m in f_matches], dtype=float)
-    f_mean = float(np.mean(f_err)) if f_err.size else float("inf")
-
-    r_matches, r_scale, r_offset, r_note, r_mean = [], 1.0, 0.0, "", float("inf")
-    reversed_positions = (NORMALIZED_TIMELINE_SCALE - positions)[::-1]
-    reversed_durations = durations[::-1]
-    if ALLOW_TIMELINE_REVERSAL and alignment.n_camera >= 3:
-        r_scale, r_offset, r_matches, r_note = _estimate_one_direction(
-            MASTER_POSITIONS, MASTER_DURATIONS, reversed_positions,
-            reversed_durations)
-        r_err = np.array([m["error"] for m in r_matches], dtype=float)
-        r_mean = float(np.mean(r_err)) if r_err.size else float("inf")
-
-    required = max(len(f_matches) * (1.0 + REVERSAL_MIN_EXTRA_MATCH_RATIO),
-                   len(f_matches) + REVERSAL_MIN_EXTRA_MATCHES)
-    wins_on_count = bool(len(r_matches) >= required and r_mean <= f_mean)
-    wins_on_error = bool(len(r_matches) >= len(f_matches)
-                         and np.isfinite(r_mean)
-                         and r_mean < f_mean * REVERSAL_MIN_ERROR_IMPROVEMENT)
-    adopt_reversed = bool(wins_on_count or wins_on_error)
-
-    if adopt_reversed:
-        alignment.is_reversed = True
-        alignment.scale, alignment.offset = r_scale, r_offset
-        alignment.fit_note = r_note
-        raw = r_matches
-        index_map = {k: alignment.n_camera - 1 - k
-                     for k in range(alignment.n_camera)}
-    else:
-        alignment.scale, alignment.offset = f_scale, f_offset
-        alignment.fit_note = f_note
-        raw = f_matches
-        index_map = {k: k for k in range(alignment.n_camera)}
-
-    matches = []
-    for match in raw:
-        camera_index = index_map[match["camera_index"]]
-        back = alignment.project_to_master(float(positions[camera_index]))
-        matches.append({
-            "master_index": match["master_index"],
-            "camera_index": camera_index,
-            "error": abs(float(MASTER_POSITIONS[match["master_index"]])
-                         - float(back)),
-        })
-    matches.sort(key=lambda m: m["master_index"])
-    alignment.matches = matches
-    alignment.errors = np.array([m["error"] for m in matches], dtype=float)
-    alignment.matched_camera_indices = {m["camera_index"] for m in matches}
-    alignment.unmatched_camera_indices = [
-        j for j in range(alignment.n_camera)
-        if j not in alignment.matched_camera_indices]
-    alignment.status = "GOOD" if matches else "FAILED_NO_MATCHES"
-    CAMERA_ALIGNMENTS[camera] = alignment
-    return alignment
-""",
+"reporting.py": ("def write_normalized_gap_timelines(p):\n"
+                 "    open(str(p), 'w').close()\n"
+                 "def write_camera_alignment_summary(p):\n"
+                 "    open(str(p), 'w').close()\n"
+                 "def write_global_gap_timeline(p):\n"
+                 "    open(str(p), 'w').close()\n"),
+"global_alignment.py": "GAP_TIMELINES = {}\nCAMERA_ALIGNMENTS = {}\n",
+"wagon_mapping.py": "GLOBAL_WAGONS = []\nGLOBAL_WAGON_COUNT = 0\n",
 "utils.py": "def banner(text):\n    pass\n",
-"gap_annotation.py": "", "snapshot_extraction.py": "", "pdf_report.py": "",
-"visualization.py": "", "wagon_mapping.py": "GLOBAL_WAGONS = []\nGLOBAL_WAGON_COUNT = 0\n",
+"classification.py": "", "gap_detection.py": "", "gap_tracking.py": "",
+"trimming.py": "", "snapshot_extraction.py": "", "pdf_report.py": "",
+"visualization.py": "", "gap_annotation.py": "",
 }
 
 
@@ -498,18 +265,27 @@ class FakeCapture:
         return True
 
     def read(self):
-        if self._index >= FRAME_COUNT:
+        if self._index >= TOTAL_FRAMES:
             return False, None
         frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        frame[0, 0, 0] = self._index            # the frame's own index
+        frame[0, 0, 0] = self._index % 256
         self._index += 1
         return True, frame
 
     def release(self):
         self.released = True
 
-    def get(self, _prop):
-        return 0
+    def get(self, prop):
+        import cv2
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return float(TOTAL_FRAMES)
+        if prop == cv2.CAP_PROP_FPS:
+            return FPS
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(WIDTH)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(HEIGHT)
+        return 0.0
 
 
 @pytest.fixture
@@ -518,7 +294,7 @@ def stub_engine(tmp_path, monkeypatch):
     engine_dir.mkdir()
     for name, source in STUB_ENGINE.items():
         (engine_dir / name).write_text(source, encoding="utf-8")
-    monkeypatch.setenv("STUB_GAP_CALLS", str(tmp_path / "gap_calls.json"))
+    monkeypatch.setenv("STUB_PROCESS_CALLS", str(tmp_path / "process.json"))
     return engine_dir
 
 
@@ -543,9 +319,14 @@ def inputs(tmp_path):
 
 
 @pytest.fixture
-def wired(monkeypatch, stub_engine):
-    """Fake cv2 capture + fake feature detectors that record their calls."""
+def wired(monkeypatch):
+    """Fake capture + fake feature detectors that record every frame shown.
+
+    Used for ASSEMBLY tests now: the materializer is what opens the video and
+    the processors are what run the detectors.
+    """
     import cv2
+
     FakeCapture.open_count = 0
     monkeypatch.setattr(cv2, "VideoCapture", FakeCapture)
 
@@ -611,8 +392,8 @@ def wired(monkeypatch, stub_engine):
     return calls
 
 
-def _process(camera_id, *, workspace, stub_engine, inputs, features=("door", "damage", "load"),
-             **kwargs):
+def _process(camera_id, *, workspace, stub_engine, inputs,
+             features=("door", "damage", "load"), **kwargs):
     video_paths, models_dir = inputs
     return camera_runner.process_camera(
         camera_id=camera_id, video_path=video_paths[camera_id],
@@ -623,11 +404,10 @@ def _process(camera_id, *, workspace, stub_engine, inputs, features=("door", "da
 
 
 # =============================================================================
-# 1. Mode routing
+# 1. Mode routing  (contract UNCHANGED)
 # =============================================================================
 
 def test_batch_is_the_default_mode():
-    """An existing production command must keep its behaviour."""
     assert mr.DEFAULT_MODE == mr.MODE_BATCH
     args = mr._build_parser().parse_args(["--local-only"])
     assert args.mode is None
@@ -639,22 +419,37 @@ def test_mode_choices_and_env_override(monkeypatch):
     assert mr.resolve_mode("sequential") == mr.MODE_SEQUENTIAL
     monkeypatch.setenv(mr.MODE_ENV_VAR, "sequential")
     assert mr.resolve_mode() == mr.MODE_SEQUENTIAL
-    assert mr.resolve_mode("batch") == mr.MODE_BATCH      # argument still wins
+    assert mr.resolve_mode("batch") == mr.MODE_BATCH
     with pytest.raises(ValueError):
         mr.resolve_mode("nope")
 
 
+def _local_inputs(directory):
+    for camera in C.ALL_CAMERAS:
+        (directory / ("%s.mp4" % camera)).write_bytes(b"v")
+
+
+def _outcome():
+    class _O:
+        final_status = "ok"
+        report_pdf_path = None
+        report_json_path = None
+        camera_pdf_paths = {}
+        processed_video_paths = {}
+        error = None
+    return _O()
+
+
 def test_mode_batch_routes_to_the_batch_architecture(monkeypatch, tmp_path):
-    """`--mode batch` must execute Batch, never the Sequential path."""
     called = []
     monkeypatch.setattr(mr, "process_batch",
                         lambda **kw: called.append("batch") or _outcome())
     monkeypatch.setattr(mr, "_run_sequential_local",
                         lambda **kw: called.append("sequential") or 0)
     _local_inputs(tmp_path)
-
     mr.run_local(local_inputs=str(tmp_path), batch_key="k",
-                 workspace=str(tmp_path / "ws"), recon_models_dir=str(tmp_path),
+                 workspace=str(tmp_path / "ws"),
+                 recon_models_dir=str(tmp_path),
                  feat_models_dir=str(tmp_path), mode="batch")
     assert called == ["batch"]
 
@@ -667,146 +462,112 @@ def test_mode_sequential_routes_to_the_sequential_architecture(monkeypatch,
     monkeypatch.setattr(mr, "_run_sequential_local",
                         lambda **kw: called.append("sequential") or 0)
     _local_inputs(tmp_path)
-
     mr.run_local(local_inputs=str(tmp_path), batch_key="k",
-                 workspace=str(tmp_path / "ws"), recon_models_dir=str(tmp_path),
+                 workspace=str(tmp_path / "ws"),
+                 recon_models_dir=str(tmp_path),
                  feat_models_dir=str(tmp_path), mode="sequential")
     assert called == ["sequential"]
 
 
-def _local_inputs(tmp_path):
-    for camera in C.ALL_CAMERAS:
-        (tmp_path / ("%s.mp4" % camera)).write_bytes(b"v")
-
-
-def _outcome():
-    class _O:
-        final_status = C.BATCH_OK if hasattr(C, "BATCH_OK") else "ok"
-        report_pdf_path = None
-        report_json_path = None
-        camera_pdf_paths: dict = {}
-        processed_video_paths: dict = {}
-        error = None
-    return _O()
-
-
 def test_sequential_accepts_partial_cameras_batch_still_requires_four(
         monkeypatch, tmp_path, capsys):
-    """The core business goal: one camera is enough for Sequential."""
-    (tmp_path / "RIGHT_UP.mp4").write_bytes(b"v")        # only one camera
-
+    (tmp_path / "RIGHT_UP.mp4").write_bytes(b"v")
     seen = {}
     monkeypatch.setattr(mr, "_run_sequential_local",
                         lambda **kw: seen.update(kw) or 0)
-    code = mr.run_local(local_inputs=str(tmp_path), batch_key="k",
+    assert mr.run_local(local_inputs=str(tmp_path), batch_key="k",
                         workspace=str(tmp_path / "ws"),
                         recon_models_dir=str(tmp_path),
-                        feat_models_dir=str(tmp_path), mode="sequential")
-    assert code == 0
+                        feat_models_dir=str(tmp_path), mode="sequential") == 0
     assert list(seen["video_paths"]) == [C.CAMERA_RIGHT_UP]
 
-    # Batch keeps its strict requirement, unchanged.
-    code = mr.run_local(local_inputs=str(tmp_path), batch_key="k",
+    assert mr.run_local(local_inputs=str(tmp_path), batch_key="k",
                         workspace=str(tmp_path / "ws"),
                         recon_models_dir=str(tmp_path),
-                        feat_models_dir=str(tmp_path), mode="batch")
-    assert code == 2
+                        feat_models_dir=str(tmp_path), mode="batch") == 2
     assert "missing videos" in capsys.readouterr().err
 
 
 # =============================================================================
-# 2. One decode per camera; GAP sees every frame; strides honoured
+# 2. The camera stage delegates to the ENGINE  (contract CHANGED, deliberately)
 # =============================================================================
 
-def test_exactly_one_decode_per_camera(stub_engine, inputs, tmp_path, wired):
-    result = _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
-                      stub_engine=stub_engine, inputs=inputs)
-    assert result.sealed
-    assert FakeCapture.open_count == 1, (
-        "the camera opened its video %d times; Sequential allows exactly one"
-        % FakeCapture.open_count)
-    assert result.decode_passes == 1
+def test_camera_stage_calls_the_engines_own_process_camera(stub_engine, inputs,
+                                                           tmp_path):
+    """Batch's Stage-1 numbers come from this function, so Sequential runs it.
 
-
-def test_gap_receives_every_decoded_frame(stub_engine, inputs, tmp_path, wired):
+    Replaces test_exactly_one_decode_per_camera and
+    test_gap_receives_every_decoded_frame: the decode and the gap detection are
+    no longer Sequential's to count, they are the engine's, and running the
+    engine's function is what makes the gap input pixels equal to Batch's.
+    """
     _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
              stub_engine=stub_engine, inputs=inputs)
-    with open(os.environ["STUB_GAP_CALLS"], encoding="utf-8") as handle:
-        gap_calls = json.load(handle)
-    assert gap_calls == list(range(FRAME_COUNT)), (
-        "GAP is continuous: it must see every decoded frame, in order")
+    marker = os.environ["STUB_PROCESS_CALLS"]
+    assert os.path.isfile(marker), "the engine's process_camera was never called"
+    assert json.load(open(marker, encoding="utf-8")) == ["right_up"]
 
 
-def test_feature_strides_are_three_three_two(stub_engine, inputs, tmp_path,
-                                             wired):
-    # RIGHT_UP is a side camera -> door only.
-    _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
-             stub_engine=stub_engine, inputs=inputs)
-    assert wired["door"] == list(range(0, FRAME_COUNT, 3))
-    assert wired["damage"] == [] and wired["load"] == []
+def test_camera_runner_performs_no_decode_and_no_inference_itself():
+    """Stronger than the old 'exactly one VideoCapture site': there are none.
 
-    # A top camera -> damage (3) and load (2), no door.
-    wired["door"].clear()
-    _process(C.CAMERA_RIGHT_UP_TOP, workspace=tmp_path / "ws2",
-             stub_engine=stub_engine, inputs=inputs)
-    assert wired["damage"] == list(range(0, FRAME_COUNT, 3))
-    assert wired["load"] == list(range(0, FRAME_COUNT, 2))
-    assert wired["door"] == []
+    Every decode and every model call now happens inside the engine's own
+    per-camera pipeline. Any reappearance here would be a mirrored algorithm.
+    """
+    code = _code("sequential/camera_runner.py")
+    for banned in ("cv2.VideoCapture", "detect_gaps_in_frame", ".predict(",
+                   "load_yolo", "GapTracker", "run_detection",
+                   "run_classification", "find_reliable_wagon_start"):
+        assert banned not in code, (
+            "the camera stage is doing its own %r again" % banned)
+    assert "camera_pipeline.process_camera" in code
 
 
-def test_feature_camera_mapping_matches_batch():
-    assert camera_runner.FEATURE_CAMERAS["door"] == C.SIDE_CAMERAS
-    assert camera_runner.FEATURE_CAMERAS["damage"] == C.TOP_CAMERAS
-    assert camera_runner.FEATURE_CAMERAS["load"] == C.TOP_CAMERAS
-    assert camera_runner.DEFAULT_STRIDES["door"] == 3
-    assert camera_runner.DEFAULT_STRIDES["damage"] == 3
-    assert camera_runner.DEFAULT_STRIDES["load"] == 2
-
-
-def test_ocr_is_not_selected_for_a_camera_run(stub_engine, inputs, tmp_path,
-                                              wired):
-    """`--features door,load,damage` must leave OCR out of the camera run."""
+def test_camera_stage_runs_no_feature_inference(stub_engine, inputs, tmp_path):
+    """Door/Damage/Load moved to assembly: Batch's frame set needs the roster."""
     workspace = tmp_path / "ws"
     _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
-             inputs=inputs, features=("door", "load", "damage"))
-
-    assert camera_runner.features_for_camera(
-        C.CAMERA_RIGHT_UP, ("door", "load", "damage")) == ("door",)
+             inputs=inputs)
     camera_evidence = ev.load_evidence(str(workspace), C.CAMERA_RIGHT_UP)
-    assert camera_evidence.observations_for("ocr") == []
-    assert "ocr" not in camera_evidence.feature_config["features"]
-    seal = ev.load_seal(str(workspace), C.CAMERA_RIGHT_UP)
-    assert "ocr" not in seal["feature_config"]["features"]
-    # ...and no OCR weight fingerprint was even taken.
-    assert not any(key.endswith("_ocr")
-                   for key in seal["model_fingerprints"])
+    assert camera_evidence.observations == []
+    assert camera_evidence.feature_config["applied_in"] == "global_assembly"
+    assert camera_evidence.feature_config["features"] == ["door", "damage",
+                                                          "load"]
 
 
-def test_sequential_import_pulls_in_neither_ocr_nor_easyocr():
-    """Process-isolated: an in-process sys.modules check would be polluted by
-    any earlier test that imported the OCR processor."""
-    import subprocess
+def test_the_complete_engine_registry_is_loaded(stub_engine, inputs, tmp_path):
+    """load_all_models validates the WHOLE camera mapping, so all five go in.
 
-    code = (
-        "import sys; sys.path.insert(0, %r);"
-        "import sequential.runner, sequential.camera_runner,"
-        " sequential.global_assembly;"
-        "print('OCR=' + str('features.ocr.processor' in sys.modules));"
-        "print('EASYOCR=' + str('easyocr' in sys.modules))" % _REPO_ROOT
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                         text=True, cwd=_REPO_ROOT)
-    assert out.returncode == 0, out.stderr
-    assert "OCR=False" in out.stdout, out.stdout
-    assert "EASYOCR=False" in out.stdout, out.stdout
+    A regression here raised, on EC2:
+      RuntimeError: Classification model(s) required by the camera mapping are
+      not loaded: ['side']
+    """
+    _process(C.CAMERA_LEFT_UP_TOP, workspace=tmp_path / "ws",
+             stub_engine=stub_engine, inputs=inputs)
+    # reaching here without RuntimeError proves both classification keys and
+    # all three gap keys were supplied
+
+
+def test_model_paths_reach_the_engine_as_path_objects(stub_engine, inputs,
+                                                      tmp_path):
+    """The engine calls .stat() on them (the 3dc848c EC2 crash)."""
+    _video_paths, models_dir = inputs
+    registries = camera_runner.engine_model_registries(
+        {slot: os.path.join(models_dir, names[0])
+         for slot, names in gc_runner.MODEL_SLOTS.items()})
+    from pathlib import Path
+    for registry in registries:
+        for value in registry.values():
+            assert isinstance(value, Path), value
+            value.stat()
 
 
 # =============================================================================
-# 3. Camera-local persistence, sealing, resume, release
+# 3. Persistence, sealing, resume, release
 # =============================================================================
 
 def test_camera_persists_evidence_and_reports_then_seals(stub_engine, inputs,
-                                                         tmp_path, wired):
+                                                         tmp_path):
     workspace = tmp_path / "ws"
     result = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
                       stub_engine=stub_engine, inputs=inputs)
@@ -814,9 +575,6 @@ def test_camera_persists_evidence_and_reports_then_seals(stub_engine, inputs,
     assert os.path.isfile(result.evidence_path)
     assert os.path.isfile(result.seal_path)
     assert os.path.isfile(result.report_paths["json_path"])
-
-    # The seal is written LAST, so it may never be newer-than-nothing: the
-    # evidence and the report must both already exist when it appears.
     seal_mtime = os.path.getmtime(result.seal_path)
     assert os.path.getmtime(result.evidence_path) <= seal_mtime
     assert os.path.getmtime(result.report_paths["json_path"]) <= seal_mtime
@@ -828,21 +586,72 @@ def test_camera_persists_evidence_and_reports_then_seals(stub_engine, inputs,
                 "feature_config", "evidence_path", "reports"):
         assert key in seal, "seal is missing %r" % key
     assert seal["status"] == ev.STATUS_SEALED
-    assert seal["frame_count"] == FRAME_COUNT
+
+
+def test_persisted_evidence_is_lossless_for_every_field_assembly_reads(
+        stub_engine, inputs, tmp_path):
+    """The whole point of the split: nothing the global half needs is dropped.
+
+    Replaces test_evidence_contains_what_assembly_needs, which checked the old
+    hand-rolled evidence shape. The field list here is not a guess: it is every
+    key `restore_camera_results` rebuilds, which in turn is every key the
+    engine's global half and `gc_runner._harvest` read.
+    """
+    workspace = tmp_path / "ws"
+    _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
+             inputs=inputs)
+    record = ev.load_evidence(str(workspace),
+                              C.CAMERA_RIGHT_UP).engine_result
+
+    # read by ga.build_normalized_timelines
+    assert record["normalized_timeline"]
+    assert record["trimmed_total_frames"] == TRIMMED_FRAMES
+    assert record["trimmed_info"]["fps"] == FPS
+    assert record["status"] == "VALID"
+    # additionally read by gc_runner._harvest
+    assert record["video_info"]["fps"] == FPS
+    assert record["video_info"]["total_frames"] == TOTAL_FRAMES
+    assert record["final_start_frame"] == REGION_START
+    assert record["final_end_frame"] == REGION_END
+    assert record["unique_gap_count"] == len(GAP_POSITIONS)
+    assert len(record["classification_timeline"]) == TOTAL_FRAMES
+    # every column the engine emits on the normalized timeline survives
+    row = record["normalized_timeline"][0]
+    for column in ("local_gap_id", "confirmation_frame",
+                   "normalized_confirmation_time", "normalized_duration",
+                   "max_confidence"):
+        assert column in row, "lost column %r" % column
+
+
+def test_restore_is_exactly_inverse_to_persist(stub_engine, inputs, tmp_path):
+    """Persist -> restore must reproduce the engine result field for field."""
+    workspace = tmp_path / "ws"
+    _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
+             inputs=inputs)
+    camera_evidence = ev.load_evidence(str(workspace), C.CAMERA_RIGHT_UP)
+    restored = global_assembly.restore_camera_results(
+        {C.CAMERA_RIGHT_UP: camera_evidence})["right_up"]
+    record = camera_evidence.engine_result
+
+    for key in ("status", "final_start_frame", "final_end_frame",
+                "trimmed_total_frames", "unique_gap_count", "n_frames"):
+        assert restored[key] == record[key], key
+    assert restored["video_info"] == record["video_info"]
+    assert restored["trimmed_info"] == record["trimmed_info"]
+    assert (restored["normalized_timeline"].to_dict("records")
+            == record["normalized_timeline"])
+    assert len(restored["timeline_df"]) == len(record["classification_timeline"])
 
 
 def test_camera_evidence_has_no_canonical_wagon_ids(stub_engine, inputs,
-                                                    tmp_path, wired):
+                                                    tmp_path):
     workspace = tmp_path / "ws"
     result = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
                       stub_engine=stub_engine, inputs=inputs)
     for path in (result.evidence_path, result.seal_path,
                  result.report_paths["json_path"]):
         with open(path, encoding="utf-8") as handle:
-            text = handle.read()
-        assert not re.search(r"\bGW_\d+\b", text), (
-            "%s contains a canonical global wagon id; those belong to Global "
-            "Assembly only" % path)
+            assert not re.search(r"\bGW_\d+\b", handle.read()), path
 
     camera_evidence = ev.load_evidence(str(workspace), C.CAMERA_RIGHT_UP)
     assert camera_evidence.segments
@@ -851,111 +660,74 @@ def test_camera_evidence_has_no_canonical_wagon_ids(stub_engine, inputs,
         assert segment["canonical"] is False
 
 
-def test_evidence_contains_what_assembly_needs(stub_engine, inputs, tmp_path,
-                                               wired):
+def test_gap_frames_are_shifted_into_original_video_numbering(
+        stub_engine, inputs, tmp_path):
+    """The engine numbers gaps inside the trimmed clip; consumers want original.
+
+    This is a real consequence of running the engine's trimming: the frame
+    indices coming back are clip-relative, and everything outside the engine
+    (camera report, snapshots) speaks original frames.
+    """
     workspace = tmp_path / "ws"
     _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
              inputs=inputs)
     camera_evidence = ev.load_evidence(str(workspace), C.CAMERA_RIGHT_UP)
-
-    assert camera_evidence.camera_id == C.CAMERA_RIGHT_UP
-    assert camera_evidence.timing.fps == FPS
-    assert camera_evidence.timing.decoded_frames == FRAME_COUNT
-    assert camera_evidence.timing.wagon_region_frames > 0
-    assert camera_evidence.gaps and all(
-        g.confirmation_frame >= 0 for g in camera_evidence.gaps)
-    assert camera_evidence.observations
-    assert camera_evidence.classification_timeline
-    assert camera_evidence.provenance["video"]["fingerprint"]
-    assert camera_evidence.provenance["models"]
-    assert camera_evidence.provenance["decode_passes"] == 1
-    assert camera_evidence.schema_version == ev.SCHEMA_VERSION
-    observation = camera_evidence.observations[0]
-    for field in ("feature", "frame_idx", "timestamp", "confidence",
-                  "raw_class"):
-        assert hasattr(observation, field)
+    assert camera_evidence.gaps
+    for gap in camera_evidence.gaps:
+        assert REGION_START <= gap.confirmation_frame <= REGION_END
+    assert camera_evidence.gaps[0].confirmation_frame == REGION_START
+    assert camera_evidence.gaps[-1].confirmation_frame == REGION_END
 
 
-def test_matching_seal_resumes_without_rerunning_inference(
-        stub_engine, inputs, tmp_path, wired):
+def test_matching_seal_resumes_without_reprocessing(stub_engine, inputs,
+                                                    tmp_path):
     workspace = tmp_path / "ws"
-    first = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
-                     stub_engine=stub_engine, inputs=inputs)
-    assert first.decode_passes == 1
+    _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
+             inputs=inputs)
+    marker = os.environ["STUB_PROCESS_CALLS"]
+    first = json.load(open(marker, encoding="utf-8"))
 
-    FakeCapture.open_count = 0
-    wired["door"].clear()
     second = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
                       stub_engine=stub_engine, inputs=inputs)
-
     assert second.reused is True
-    assert second.decode_passes == 0
-    assert FakeCapture.open_count == 0, "resume must not open the video"
-    assert wired["door"] == [], "resume must not run inference"
+    assert json.load(open(marker, encoding="utf-8")) == first, (
+        "resume re-ran the engine pipeline")
 
 
 def test_stale_evidence_is_reprocessed_and_the_reason_is_reported(
-        stub_engine, inputs, tmp_path, wired):
+        stub_engine, inputs, tmp_path):
     workspace = tmp_path / "ws"
-    video_paths, models_dir = inputs
+    video_paths, _models = inputs
     _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
              inputs=inputs)
-
-    # Change the input video -> the fingerprint no longer matches.
     with open(video_paths[C.CAMERA_RIGHT_UP], "wb") as handle:
-        handle.write(b"different video content")
+        handle.write(b"different content")
     os.utime(video_paths[C.CAMERA_RIGHT_UP], (1, 1))
-
-    FakeCapture.open_count = 0
     again = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
                      stub_engine=stub_engine, inputs=inputs)
     assert again.reused is False
     assert "video changed" in again.reason
-    assert FakeCapture.open_count == 1
 
 
-def test_force_ignores_a_matching_seal(stub_engine, inputs, tmp_path, wired):
+def test_force_ignores_a_matching_seal(stub_engine, inputs, tmp_path):
     workspace = tmp_path / "ws"
     _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
              inputs=inputs)
-    FakeCapture.open_count = 0
     forced = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
                       stub_engine=stub_engine, inputs=inputs, force=True)
     assert forced.reused is False
-    assert FakeCapture.open_count == 1
 
 
-def test_resources_are_released_after_sealing(stub_engine, inputs, tmp_path,
-                                              wired):
+def test_resources_are_released_after_sealing(stub_engine, inputs, tmp_path):
     from features import _common
 
     _common._MODEL_CACHE["stale"] = object()
     _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
              stub_engine=stub_engine, inputs=inputs)
-    assert _common._MODEL_CACHE == {}, (
-        "a camera's models must be released before the next camera starts")
+    assert _common._MODEL_CACHE == {}
 
 
-def test_the_one_capture_is_always_released(stub_engine, inputs, tmp_path,
-                                            wired):
-    captured = []
-    real_init = FakeCapture.__init__
-
-    def _tracking_init(self, path):
-        real_init(self, path)
-        captured.append(self)
-
-    FakeCapture.__init__ = _tracking_init
-    try:
-        _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
-                 stub_engine=stub_engine, inputs=inputs)
-    finally:
-        FakeCapture.__init__ = real_init
-    assert captured and all(capture.released for capture in captured)
-
-
-def test_engine_session_leaves_nothing_behind(stub_engine, inputs, tmp_path,
-                                              wired):
+def test_engine_session_leaves_nothing_behind(stub_engine, inputs, tmp_path):
     _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
              stub_engine=stub_engine, inputs=inputs)
     for name in gc_runner.ENGINE_MODULES:
@@ -967,38 +739,28 @@ def test_engine_session_leaves_nothing_behind(stub_engine, inputs, tmp_path,
     assert os.path.abspath(reporting.__file__).startswith(_REPO_ROOT)
 
 
-# =============================================================================
-# 4. No canonical roster during camera processing
-# =============================================================================
-
 def test_camera_processing_creates_no_canonical_roster(stub_engine, inputs,
-                                                       tmp_path, wired):
+                                                       tmp_path):
     workspace = tmp_path / "ws"
     _process(C.CAMERA_RIGHT_UP, workspace=workspace, stub_engine=stub_engine,
              inputs=inputs)
-    # No global contract may exist yet.
-    assert not os.path.exists(
-        os.path.join(str(workspace), "global_state", "global_train_state.json"))
-    assert not os.path.exists(
-        os.path.join(str(workspace), ev.COMBINED_DIRNAME,
-                     "combined_train_report.json"))
+    assert not os.path.exists(os.path.join(
+        str(workspace), "global_state", "global_train_state.json"))
+    assert not os.path.exists(os.path.join(
+        str(workspace), ev.COMBINED_DIRNAME, "combined_train_report.json"))
 
 
 def test_a_single_camera_report_is_valid_on_its_own(stub_engine, inputs,
-                                                    tmp_path, wired):
-    """RIGHT_UP alone must produce its JSON and PDF, no waiting."""
-    workspace = tmp_path / "ws"
-    result = _process(C.CAMERA_RIGHT_UP, workspace=workspace,
+                                                    tmp_path):
+    result = _process(C.CAMERA_RIGHT_UP, workspace=tmp_path / "ws",
                       stub_engine=stub_engine, inputs=inputs)
-
     with open(result.report_paths["json_path"], encoding="utf-8") as handle:
         document = json.load(handle)
     assert document["report_type"] == "single_camera"
     assert document["canonical"] is False
     assert "NOT canonical" in document["disclaimer"]
     assert document["camera_id"] == C.CAMERA_RIGHT_UP
-    assert document["local_gaps"]["count"] >= 1
-    assert "canonical gap authority" in document["gap_authority"]
+    assert document["local_gaps"]["count"] == len(GAP_POSITIONS)
 
     try:
         import reportlab                                        # noqa: F401
@@ -1009,23 +771,55 @@ def test_a_single_camera_report_is_valid_on_its_own(stub_engine, inputs,
 
 
 # =============================================================================
-# 5. Global Assembly
+# 4. Global Assembly -- wiring
 # =============================================================================
 
-def _seal_all(stub_engine, inputs, workspace, wired, cameras=C.ALL_CAMERAS):
-    results = []
-    for camera_id in cameras:
-        results.append(_process(camera_id, workspace=workspace,
-                                stub_engine=stub_engine, inputs=inputs))
-    return results
+def test_assembly_calls_the_engines_own_global_half():
+    import inspect
+
+    source = inspect.getsource(global_assembly.run_engine_global_half)
+    for call in ("build_normalized_timelines", "select_master_camera",
+                 "validate_temporal_ordering", "set_master_camera",
+                 "match_all_cameras", "report_alignment_mappings",
+                 "recover_missing_gaps", "collect_unmatched_extras",
+                 "build_global_gap_timeline", "build_global_wagon_timeline"):
+        assert call in source, "the engine's %s is not called" % call
 
 
-def test_assembly_is_not_ready_without_the_authority(tmp_path):
+def test_assembly_then_runs_batchs_own_stages():
+    """Every stage after the engine is Batch's own implementation."""
+    import inspect
+
+    source = inspect.getsource(global_assembly.assemble)
+    for call in ("gc_runner._harvest", "adapter.write_documents",
+                 "wagon_cache_builder.build", "wagon_state_builder.build",
+                 "camera_reports.build_all", "combined_train_report.build"):
+        assert call in source, "Batch's %s is not reused" % call
+
+
+def test_assembly_runs_batchs_processors_with_batchs_strides():
+    """Where the 3/3/2 strides live now (they moved, they did not vanish)."""
+    import inspect
+
+    source = inspect.getsource(global_assembly._run_features)
+    assert 'for name in ("load", "door", "ocr", "damage")' in source, (
+        "LOAD must complete before DAMAGE: damage reads the load result")
+    assert "load_feature_runner" in source, (
+        "the processors must be Batch's, resolved through Batch's registry")
+    # whitespace-insensitive: the real source wraps these across lines
+    flat = " ".join(source.split())
+    for needle in ('"door_sample_stride", 3', '"damage_sample_stride", 3',
+                   '"load_sample_stride", 2'):
+        assert needle in flat, "Batch's default stride changed: %s" % needle
+
+
+def test_assembly_is_not_batch_comparable_without_every_camera(tmp_path):
+    """The master is unknown until every camera is counted."""
     ready, sealed, missing, reason = global_assembly.readiness(str(tmp_path))
     assert ready is False
     assert sealed == []
-    assert C.MASTER_CAMERA in missing
-    assert C.MASTER_CAMERA in reason
+    assert set(missing) == set(C.ALL_CAMERAS)
+    assert "not Batch-comparable" in reason
 
 
 def test_assembly_refuses_to_fabricate_a_train(tmp_path):
@@ -1038,279 +832,144 @@ def test_assembly_refuses_to_fabricate_a_train(tmp_path):
                                            "combined_train_report.json"))
 
 
-def test_assembly_builds_exactly_one_canonical_roster(stub_engine, inputs,
-                                                      tmp_path, wired):
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-
-    result = global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-
-    assert result.ready, result.reason
-    # three gap frames -> three canonical gaps -> two canonical wagons
-    assert result.global_gap_count == 3
-    assert result.global_wagon_count == result.global_gap_count - 1
-
-    from core.global_state_loader import (load_global_train_state,
-                                          verify_roster_integrity)
-    state = load_global_train_state(result.state_json_path)
-    assert [w.global_id for w in state.wagons] == ["GW_1", "GW_2"]
-    assert verify_roster_integrity(state) == []
-    assert state.master_camera == C.MASTER_CAMERA
-    assert state.uses_camera_frame_ranges
-    assert len(state.global_gaps) == state.total_wagons + 1
-
-
-def test_assembly_produces_one_combined_report(stub_engine, inputs, tmp_path,
-                                               wired):
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-    result = global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-
-    assert result.report_json_path and os.path.isfile(result.report_json_path)
-    assert ev.COMBINED_DIRNAME in result.report_json_path
-    try:
-        import reportlab                                        # noqa: F401
-    except ImportError:
-        return
-    assert result.report_pdf_path and os.path.isfile(result.report_pdf_path)
-
-
 def test_master_camera_is_chosen_the_way_batch_chooses_it():
     """Batch has NO fixed master: the engine picks the max-unique-gaps camera.
 
-    Sequential must not substitute a fixed authority -- the global gap count IS
-    the master's gap count, so a different master means a different wagon
-    count. (An earlier version of this test asserted a fixed RIGHT_UP, which is
-    the RETAINED wagon_count engine's rule, not this engine's.)
+    An earlier version of this test asserted a fixed RIGHT_UP, which was the
+    divergence, not the contract. The global gap count IS the master's gap
+    count, so a wrong master means a wrong wagon count.
     """
     import inspect
 
-    source = inspect.getsource(global_assembly.populate_engine_alignment_state)
-    assert "select_master_camera()" in source, (
-        "the master must be chosen by the engine, not by Sequential")
+    source = inspect.getsource(global_assembly.run_engine_global_half)
+    assert "select_master_camera()" in source
     assert "set_master_camera()" in source
-
-    # a Batch-comparable assembly needs every camera, because the winner is
-    # not known until all of them are counted
     assert global_assembly.required_cameras() == tuple(C.ALL_CAMERAS)
-
-    harvest_source = inspect.getsource(global_assembly.build_harvest)
-    assert "C.MASTER_CAMERA" not in harvest_source, (
-        "the harvest is still hardcoding a master camera")
+    assert "C.MASTER_CAMERA" not in inspect.getsource(global_assembly.assemble)
 
 
-def test_assembly_is_not_batch_comparable_without_every_camera(tmp_path):
-    ready, _sealed, missing, reason = global_assembly.readiness(str(tmp_path))
-    assert ready is False
-    assert "not Batch-comparable" in reason
-    assert set(missing) == set(C.ALL_CAMERAS)
-
-
-def test_support_camera_extra_gap_is_diagnostic_not_a_wagon(stub_engine, inputs,
-                                                            tmp_path, wired):
-    """An extra gap seen only by a support camera must not create a wagon."""
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-
-    # Give LEFT_UP an extra local gap while REMOVING another, so it still has
-    # fewer gaps than the master and cannot win master selection. The extra
-    # position must then stay diagnostic instead of creating a wagon.
-    path = ev.evidence_path(str(workspace), C.CAMERA_LEFT_UP)
-    document = json.loads(open(path, encoding="utf-8").read())
-    document["gaps"] = document["gaps"][:-2] + [{
-        "local_gap_id": "LEFT_UP_EXTRA", "confirmation_frame": 40,
-        "first_frame": 40, "last_frame": 40, "normalized_position": 700.0,
-        "max_confidence": 0.9, "average_confidence": 0.9, "frame_count": 1,
-        "normalized_duration": 5.0}]
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
-
-    result = global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-
-    assert result.global_gap_count == 3, "a support camera changed the count"
-    assert result.global_wagon_count == 2
-    extra = (result.diagnostics["alignments"][C.CAMERA_LEFT_UP]
-             ["extra_camera_gaps"])
-    assert extra and "DIAGNOSTIC" in extra[0]["note"]
-
-
-def test_support_camera_missing_gap_keeps_the_canonical_gap(stub_engine, inputs,
-                                                            tmp_path, wired):
-    """A canonical gap a support camera missed is projected, never dropped."""
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-
-    path = ev.evidence_path(str(workspace), C.CAMERA_LEFT_UP)
-    document = json.loads(open(path, encoding="utf-8").read())
-    document["gaps"] = document["gaps"][:1]          # LEFT_UP now misses two
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(document, handle)
-
-    result = global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-
-    assert result.global_gap_count == 3
-    from core.global_state_loader import load_global_train_state
-    state = load_global_train_state(result.state_json_path)
-    # LEFT_UP still receives a window for every canonical wagon: the gap it
-    # missed was projected in rather than dropped.
-    from global_counting import adapter
-    for wagon in state.wagons:
-        entry = wagon.camera_frame_ranges[C.CAMERA_LEFT_UP]
-        assert entry["start_frame"] is not None
-        assert entry["status"] in (adapter.STATUS_DETECTED,
-                                  adapter.STATUS_RECOVERED)
-    recovered = [w.global_id for w in state.wagons
-                 if w.camera_frame_ranges[C.CAMERA_LEFT_UP]["status"]
-                 == adapter.STATUS_RECOVERED]
-    assert recovered, "a missed canonical gap must be projected as RECOVERED"
-
-
-def test_assembly_assigns_observations_through_ownership(stub_engine, inputs,
-                                                         tmp_path, wired):
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-    result = global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-    assert result.ready
-
-    from core import wagon_ownership
-    from core.global_state_loader import load_global_train_state
-    state = load_global_train_state(result.state_json_path)
-    ownership = wagon_ownership.for_state(state)
-    assert ownership is not None
-    assert wagon_ownership.BOUNDARY_GOES_TO == "next_wagon"
-
-    evidences = {camera_id: ev.load_evidence(str(workspace), camera_id)
-                 for camera_id in C.ALL_CAMERAS}
-    assigned = global_assembly.assign_observations(state, evidences)
-
-    # No observation may be claimed by two wagons.
-    seen = {}
-    for gw_id, features in assigned.items():
-        for feature, per_camera in features.items():
-            for camera_id, observations in per_camera.items():
-                for observation in observations:
-                    key = (camera_id, feature, observation.frame_idx,
-                           observation.raw_class, observation.confidence)
-                    seen.setdefault(key, []).append(gw_id)
-    doubles = {k: v for k, v in seen.items() if len(set(v)) > 1}
-    assert doubles == {}, "observation owned by two wagons: %s" % list(doubles)[:3]
-
-
-def test_assembly_preserves_multi_door(stub_engine, inputs, tmp_path, wired):
-    """The b6f67b5 multi-door behaviour must survive the new assembly path."""
-    workspace = tmp_path / "ws"
-    _seal_all(stub_engine, inputs, workspace, wired)
-    global_assembly.assemble(
-        workspace=str(workspace), repo_root=_REPO_ROOT, batch_key="archtest",
-        engine_dir=str(stub_engine), verbose=False)
-
-    door_dir = os.path.join(str(workspace), "wagon_states", "door")
-    payloads = [json.load(open(os.path.join(door_dir, name), encoding="utf-8"))
-                for name in sorted(os.listdir(door_dir))]
-    assert payloads
-    for payload in payloads:
-        assert "doors" in payload
-        assert "door_status" in payload
-        for door in payload["doors"]:
-            assert "door_index" in door and "state" in door
-        # the stub alternates open/closed, so a wagon sees both states
-    states = {d["state"] for p in payloads for d in p["doors"]}
-    assert states, "no door state survived assembly"
+def test_assembly_refuses_evidence_without_an_engine_record(tmp_path):
+    """Evidence from an older Sequential build must be reprocessed, not guessed."""
+    camera_evidence = ev.CameraEvidence(camera_id=C.CAMERA_RIGHT_UP)
+    with pytest.raises(global_assembly.AssemblyNotReady) as excinfo:
+        global_assembly.restore_camera_results(
+            {C.CAMERA_RIGHT_UP: camera_evidence})
+    assert "--force-cameras" in str(excinfo.value)
 
 
 # =============================================================================
-# 6. Static architecture audit
+# 5. Global Assembly -- against the REAL engine
 # =============================================================================
 
-def _source(relative):
-    with open(os.path.join(_REPO_ROOT, relative), encoding="utf-8") as handle:
-        return handle.read()
+@needs_engine
+def test_real_engine_forms_the_canonical_roster_from_persisted_records(
+        tmp_path, capsys):
+    """Five persisted gaps -> five global gaps -> four wagons, GW_1..GW_4."""
+    workspace = str(tmp_path / "ws")
+    F.seal_all(workspace)
+    snapshot = F.run_global_half(
+        REAL_ENGINE, global_assembly.restore_camera_results(
+            {c: ev.load_evidence(workspace, c) for c in C.ALL_CAMERAS}),
+        str(tmp_path / "engine_out"))
+    capsys.readouterr()
+
+    assert snapshot["global_gap_count"] == len(F.CANONICAL_POSITIONS)
+    assert snapshot["global_wagon_count"] == snapshot["global_gap_count"] - 1
+    assert snapshot["master_camera"] == "right_up"
+    assert "most confirmed unique gaps" in snapshot["master_reason"]
 
 
-def _code_only(text):
-    """Strip comments and docstring blocks well enough to audit real calls."""
-    without_docstrings = re.sub(r'"""(?:.|\n)*?"""', "", text)
-    return "\n".join(line for line in without_docstrings.splitlines()
-                     if not line.strip().startswith("#"))
+@needs_engine
+def test_real_engine_master_follows_the_gap_count_not_the_camera_name(
+        tmp_path, capsys):
+    """Give a non-first camera the most gaps and it must become master."""
+    workspace = str(tmp_path / "ws")
+    extra = list(F.CANONICAL_POSITIONS) + [875.0]
+    F.seal_all(workspace, positions_by_camera={C.CAMERA_LEFT_UP_TOP: extra})
+    snapshot = F.run_global_half(
+        REAL_ENGINE, global_assembly.restore_camera_results(
+            {c: ev.load_evidence(workspace, c) for c in C.ALL_CAMERAS}),
+        str(tmp_path / "engine_out"))
+    capsys.readouterr()
+
+    assert snapshot["master_camera"] == "left_up_top"
+    assert snapshot["global_gap_count"] == len(extra)
+    assert snapshot["global_wagon_count"] == len(extra) - 1
 
 
-AUDIT_FORBIDDEN_IN_ASSEMBLY = (
-    "VideoCapture", "load_yolo", "GapTracker", ".predict(",
-    "detect_gaps_in_frame", "classify_video_frames",
-)
+@needs_engine
+def test_real_engine_extra_gap_on_a_support_camera_creates_no_wagon(tmp_path,
+                                                                    capsys):
+    """Only the master defines the count; a support camera's extra is diagnostic.
+
+    LEFT_UP gets an extra detection but is kept BELOW the master's gap count, so
+    it cannot win master selection -- which is the situation this protects.
+    """
+    workspace = str(tmp_path / "ws")
+    positions = list(F.CANONICAL_POSITIONS)
+    support = positions[:-1] + [690.0]          # same count, one displaced
+    F.seal_all(workspace, positions_by_camera={C.CAMERA_LEFT_UP: support})
+    snapshot = F.run_global_half(
+        REAL_ENGINE, global_assembly.restore_camera_results(
+            {c: ev.load_evidence(workspace, c) for c in C.ALL_CAMERAS}),
+        str(tmp_path / "engine_out"))
+    capsys.readouterr()
+
+    assert snapshot["global_gap_count"] == len(positions)
+    assert snapshot["global_wagon_count"] == len(positions) - 1
 
 
-def test_global_assembly_performs_no_inference_and_no_decode():
-    """The audit that keeps `INFERENCE ONCE -> PERSIST -> INTERPRET` true."""
-    code = _code_only(_source("sequential/global_assembly.py"))
-    for needle in AUDIT_FORBIDDEN_IN_ASSEMBLY:
-        assert needle not in code, (
-            "Global Assembly must not %r: it consumes persisted evidence only"
-            % needle)
+@needs_engine
+def test_real_engine_recovers_a_gap_a_support_camera_missed(tmp_path, capsys):
+    """A missing support detection must not shrink the canonical train."""
+    workspace = str(tmp_path / "ws")
+    positions = list(F.CANONICAL_POSITIONS)
+    F.seal_all(workspace,
+               positions_by_camera={C.CAMERA_LEFT_UP: positions[:-1]})
+    snapshot = F.run_global_half(
+        REAL_ENGINE, global_assembly.restore_camera_results(
+            {c: ev.load_evidence(workspace, c) for c in C.ALL_CAMERAS}),
+        str(tmp_path / "engine_out"))
+    capsys.readouterr()
+
+    assert snapshot["global_gap_count"] == len(positions)
+    assert snapshot["global_wagon_count"] == len(positions) - 1
+    assert snapshot["camera_gap_counts"]["left_up"] == len(positions) - 1
 
 
-def test_camera_local_code_builds_no_canonical_roster():
-    for relative in ("sequential/camera_runner.py", "sequential/camera_report.py"):
-        code = _code_only(_source(relative))
-        assert not re.search(r'"GW_|\bGW_\d', code), (
-            "%s references a canonical wagon id" % relative)
-        for needle in ("build_global_train_state_document", "write_documents",
-                       "verify_roster_integrity"):
-            assert needle not in code, (
-                "%s builds the canonical contract; that is Global Assembly's "
-                "job" % relative)
+@needs_engine
+def test_real_engine_reports_no_reversal_for_co_ordered_cameras(tmp_path,
+                                                                capsys):
+    """The reversal test must run and must not fire on co-ordered timelines.
 
+    A camera is never reversed for being a left or a right camera; only the
+    alignment error may decide that.
+    """
+    workspace = str(tmp_path / "ws")
+    F.seal_all(workspace)
+    snapshot = F.run_global_half(
+        REAL_ENGINE, global_assembly.restore_camera_results(
+            {c: ev.load_evidence(workspace, c) for c in C.ALL_CAMERAS}),
+        str(tmp_path / "engine_out"))
+    capsys.readouterr()
 
-def test_camera_runner_opens_exactly_one_capture_in_source():
-    code = _code_only(_source("sequential/camera_runner.py"))
-    assert code.count("cv2.VideoCapture(") == 1, (
-        "one decode lifecycle per camera means exactly one VideoCapture site")
-    assert code.count("capture.release()") >= 1
-
-
-def test_only_global_assembly_writes_the_combined_report():
-    assembly = _code_only(_source("sequential/global_assembly.py"))
-    assert "combined_train_report" in assembly
-    for relative in ("sequential/camera_runner.py",
-                     "sequential/camera_report.py",
-                     "sequential/runner.py"):
-        assert "combined_train_report" not in _code_only(_source(relative)), (
-            "%s must not write the combined report" % relative)
-
-
-def test_master_runner_does_not_duplicate_detector_logic():
-    code = _code_only(_source("orchestrator/master_runner.py"))
-    for needle in ("VideoCapture", "detect_gaps_in_frame", "load_yolo",
-                   ".predict("):
-        assert needle not in code, (
-            "master_runner is a selection layer; %r belongs in an "
-            "architecture module" % needle)
-
-
-def test_global_count_ec2_is_not_vendored():
-    assert not os.path.exists(os.path.join(_REPO_ROOT,
-                                           "global_wagon_pipeline.py"))
-    for root, dirs, files in os.walk(os.path.join(_REPO_ROOT, "sequential")):
-        dirs[:] = [d for d in dirs if d != "__pycache__"]
-        assert "global_wagon_pipeline.py" not in files
+    assert snapshot["alignments"], "no camera was aligned"
+    for camera, mapping in snapshot["alignments"].items():
+        assert mapping["reversed"] is False, camera
+        assert mapping["scale"] == pytest.approx(1.0, abs=1e-9)
+        assert mapping["unmatched"] == []
 
 
 # =============================================================================
-# 7. Sequential runner orchestration
+# 6. Sequential runner orchestration
 # =============================================================================
+
+def test_camera_order_is_deterministic_and_configuration_driven():
+    paths = {camera: "x" for camera in reversed(C.ALL_CAMERAS)}
+    assert sequential_runner.camera_order(paths) == list(C.ALL_CAMERAS)
+
 
 def _weights(tmp_path):
-    """run_sequential resolves the five engine weights before any camera."""
     directory = tmp_path / "recon_models"
     directory.mkdir(exist_ok=True)
     for filenames in gc_runner.MODEL_SLOTS.values():
@@ -1318,28 +977,18 @@ def _weights(tmp_path):
     return str(directory)
 
 
-def test_camera_order_is_deterministic_and_configuration_driven():
-    paths = {camera: "x" for camera in reversed(C.ALL_CAMERAS)}
-    assert sequential_runner.camera_order(paths) == list(C.ALL_CAMERAS)
-    assert sequential_runner.camera_order({C.CAMERA_LEFT_UP_TOP: "x"}) == \
-        [C.CAMERA_LEFT_UP_TOP]
-
-
-def test_runner_processes_cameras_in_order_then_assembles(monkeypatch, tmp_path):
-    """Sequential is camera -> seal -> camera -> ... -> ONE assembly."""
+def test_runner_processes_cameras_in_order_then_assembles(monkeypatch,
+                                                          tmp_path):
     events = []
-
-    def _fake_camera(**kwargs):
-        events.append(("camera", kwargs["camera_id"]))
-        return camera_runner.CameraRunResult(
-            camera_id=kwargs["camera_id"], status=ev.STATUS_SEALED)
-
-    def _fake_assemble(**kwargs):
-        events.append(("assembly", None))
-        return global_assembly.AssemblyResult(ready=True, reason="ok")
-
-    monkeypatch.setattr(camera_runner, "process_camera", _fake_camera)
-    monkeypatch.setattr(global_assembly, "assemble", _fake_assemble)
+    monkeypatch.setattr(
+        camera_runner, "process_camera",
+        lambda **kw: events.append(("camera", kw["camera_id"]))
+        or camera_runner.CameraRunResult(camera_id=kw["camera_id"],
+                                         status=ev.STATUS_SEALED))
+    monkeypatch.setattr(
+        global_assembly, "assemble",
+        lambda **kw: events.append(("assembly", None))
+        or global_assembly.AssemblyResult(ready=True))
 
     sequential_runner.run_sequential(
         video_paths={c: "v" for c in C.ALL_CAMERAS},
@@ -1347,28 +996,26 @@ def test_runner_processes_cameras_in_order_then_assembles(monkeypatch, tmp_path)
         recon_models_dir=_weights(tmp_path), feat_models_dir=str(tmp_path),
         features=("door", "load", "damage"), batch_key="k", verbose=False)
 
-    assert events == [("camera", c) for c in C.ALL_CAMERAS] + [("assembly", None)]
-    assert len([e for e in events if e[0] == "assembly"]) == 1, (
-        "exactly one Global Assembly per run")
+    assert events == ([("camera", c) for c in C.ALL_CAMERAS]
+                      + [("assembly", None)])
+    assert len([e for e in events if e[0] == "assembly"]) == 1
 
 
 def test_a_failing_camera_does_not_stop_the_others(monkeypatch, tmp_path):
-    def _fake_camera(**kwargs):
+    def _fake(**kwargs):
         if kwargs["camera_id"] == C.CAMERA_LEFT_UP:
             raise RuntimeError("boom")
-        return camera_runner.CameraRunResult(
-            camera_id=kwargs["camera_id"], status=ev.STATUS_SEALED)
+        return camera_runner.CameraRunResult(camera_id=kwargs["camera_id"],
+                                             status=ev.STATUS_SEALED)
 
-    monkeypatch.setattr(camera_runner, "process_camera", _fake_camera)
+    monkeypatch.setattr(camera_runner, "process_camera", _fake)
     monkeypatch.setattr(global_assembly, "assemble",
                         lambda **kw: global_assembly.AssemblyResult(True))
-
     outcome = sequential_runner.run_sequential(
         video_paths={c: "v" for c in C.ALL_CAMERAS},
         workspace=str(tmp_path), repo_root=_REPO_ROOT,
         recon_models_dir=_weights(tmp_path), feat_models_dir=str(tmp_path),
         features=("door",), batch_key="k", verbose=False)
-
     assert outcome.failed_cameras == [C.CAMERA_LEFT_UP]
     assert len(outcome.sealed_cameras) == 3
 
@@ -1376,11 +1023,11 @@ def test_a_failing_camera_does_not_stop_the_others(monkeypatch, tmp_path):
 def test_skip_assembly_stops_after_camera_reports(monkeypatch, tmp_path):
     monkeypatch.setattr(camera_runner, "process_camera",
                         lambda **kw: camera_runner.CameraRunResult(
-                            camera_id=kw["camera_id"], status=ev.STATUS_SEALED))
+                            camera_id=kw["camera_id"],
+                            status=ev.STATUS_SEALED))
     called = []
     monkeypatch.setattr(global_assembly, "assemble",
                         lambda **kw: called.append(1))
-
     outcome = sequential_runner.run_sequential(
         video_paths={C.CAMERA_RIGHT_UP: "v"}, workspace=str(tmp_path),
         repo_root=_REPO_ROOT, recon_models_dir=_weights(tmp_path),
@@ -1391,11 +1038,9 @@ def test_skip_assembly_stops_after_camera_reports(monkeypatch, tmp_path):
 
 
 def test_single_camera_run_reports_then_declines_assembly(stub_engine, inputs,
-                                                          tmp_path, wired):
-    """End to end with ONE camera: local report yes, combined report no."""
+                                                          tmp_path):
     video_paths, models_dir = inputs
     workspace = tmp_path / "ws"
-
     outcome = sequential_runner.run_sequential(
         video_paths={C.CAMERA_LEFT_UP: video_paths[C.CAMERA_LEFT_UP]},
         workspace=str(workspace), repo_root=_REPO_ROOT,
@@ -1404,9 +1049,73 @@ def test_single_camera_run_reports_then_declines_assembly(stub_engine, inputs,
         engine_dir=str(stub_engine), verbose=False)
 
     assert outcome.sealed_cameras == [C.CAMERA_LEFT_UP]
-    paths = outcome.cameras[0].report_paths
-    assert os.path.isfile(paths["json_path"])
-    # RIGHT_UP is the canonical authority and is absent -> no combined train.
+    assert os.path.isfile(outcome.cameras[0].report_paths["json_path"])
     assert outcome.assembly is not None
     assert outcome.assembly.ready is False
-    assert C.MASTER_CAMERA in outcome.assembly.reason
+    assert "not Batch-comparable" in outcome.assembly.reason
+
+
+# =============================================================================
+# 7. Static architecture audit
+# =============================================================================
+
+def _code(relative):
+    """Source with docstrings and comments stripped, for auditing real calls."""
+    text = open(os.path.join(_REPO_ROOT, relative), encoding="utf-8").read()
+    without_docstrings = re.sub(r'"""(?:.|\n)*?"""', "", text)
+    return "\n".join(line for line in without_docstrings.splitlines()
+                     if not line.strip().startswith("#"))
+
+
+def test_camera_local_code_builds_no_canonical_roster():
+    for relative in ("sequential/camera_runner.py",
+                     "sequential/camera_report.py"):
+        code = _code(relative)
+        assert not re.search(r'"GW_|\bGW_\d', code), relative
+        for banned in ("build_global_train_state_document", "write_documents",
+                       "verify_roster_integrity"):
+            assert banned not in code, "%s: %s" % (relative, banned)
+
+
+def test_only_global_assembly_writes_the_combined_report():
+    assert "combined_train_report" in _code("sequential/global_assembly.py")
+    for relative in ("sequential/camera_runner.py",
+                     "sequential/camera_report.py",
+                     "sequential/runner.py"):
+        assert "combined_train_report" not in _code(relative), relative
+
+
+def test_sequential_holds_no_mirrored_algorithm():
+    """Every mirrored implementation is gone; the engine or Batch does the work.
+
+    Replaces test_global_assembly_performs_no_inference_and_no_decode. Assembly
+    now DOES infer -- through Batch's processors -- so the meaningful audit is
+    no longer "does it infer" but "does it reimplement".
+    """
+    assembly = _code("sequential/global_assembly.py")
+    for banned in ("monotonic_gap_match", "robust_linear_fit",
+                   "_estimate_one_direction", "EvidenceAggregator",
+                   "_filter_detections_for_top", "_LOADED_RATIO_THRESHOLD",
+                   "_door_evidence_from_groups", "_pick_side_state",
+                   "SnapshotStore", "classification_adapter"):
+        assert banned not in assembly, (
+            "assembly re-implements %r instead of calling Batch/the engine"
+            % banned)
+    assert not os.path.exists(os.path.join(_REPO_ROOT, "sequential",
+                                           "classification_adapter.py")), (
+        "the mirrored classification adapter must stay deleted")
+
+
+def test_master_runner_does_not_duplicate_detector_logic():
+    code = _code("orchestrator/master_runner.py")
+    for banned in ("VideoCapture", "detect_gaps_in_frame", "load_yolo",
+                   ".predict("):
+        assert banned not in code, banned
+
+
+def test_global_count_ec2_is_not_vendored():
+    assert not os.path.exists(os.path.join(_REPO_ROOT,
+                                           "global_wagon_pipeline.py"))
+    for root, dirs, files in os.walk(os.path.join(_REPO_ROOT, "sequential")):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        assert "global_wagon_pipeline.py" not in files

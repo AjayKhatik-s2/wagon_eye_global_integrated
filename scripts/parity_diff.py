@@ -32,6 +32,19 @@ floating-point quantities produced by the same algorithm (normalized positions,
 alignment scale/offset, confidences) are compared with --tolerance, default
 1e-6, because the same arithmetic on the same inputs can still differ in the
 last bits when it is reached by a different call order.
+
+DATA vs METADATA
+Two runs of the same train are never byte-identical: they ran at different
+times, into different output directories, and took different amounts of wall
+clock. Those fields are EXPECTED to differ and are listed by name in
+EXPECTED_METADATA below. They are reported in a separate section as "expected
+metadata differences" -- counted and shown, never silently dropped -- so an
+operator can see exactly what was excused. Everything not on that list is data,
+and any difference in it is a divergence.
+
+The distinction is by FIELD NAME, not by value: a field is excused because it is
+provenance, never because its values happen to disagree. --strict-metadata turns
+the excused set into divergences too, for when you want to see everything.
 """
 
 from __future__ import annotations
@@ -73,6 +86,48 @@ SOURCE = {
 }
 
 
+# Fields that legitimately differ between two runs of the same train. Matched
+# on the whole field name or its last dotted component. Each says why.
+EXPECTED_METADATA = {
+    "generated_at":        "wall-clock time the document was written",
+    "created_at":          "wall-clock time the document was written",
+    "sealed_at":           "wall-clock time the camera seal was written",
+    "timestamp":           "wall-clock time",
+    "batch_key":           "per-run identifier, chosen by the operator",
+    "run_id":              "per-run identifier",
+    "output_dir":          "the output directory each run was given",
+    "workspace":           "the workspace each run was given",
+    "path":                "absolute path inside a run's own directory",
+    "paths":               "absolute paths inside a run's own directory",
+    "evidence_path":       "absolute path inside a run's own directory",
+    "processing_seconds":  "wall-clock duration -- Sequential is expected to "
+                           "differ, that is the point of the architecture",
+    "seconds":             "wall-clock duration",
+    "duration_seconds":    "wall-clock duration",
+    "elapsed":             "wall-clock duration",
+    "mode":                "batch vs sequential -- the one intended difference "
+                           "between the two runs",
+    "produced_by":         "which component wrote the record",
+    "decode_count":        "Sequential decodes twice per camera by design",
+}
+
+
+def metadata_reason(field):
+    """Why `field` is provenance rather than data, or None if it is data.
+
+    Bracket subscripts are stripped from EACH dotted component, so a nested
+    field like `wagons[0].sealed_at` is recognised by its tail. Truncating at
+    the first `[` instead would read that field as `wagons` and classify a
+    per-wagon timestamp as DATA -- reporting a false divergence on every real
+    run, which is exactly the failure this function exists to prevent.
+    """
+    parts = [part.split("[")[0] for part in field.split(".")]
+    bare = ".".join(parts)
+    if bare in EXPECTED_METADATA:
+        return EXPECTED_METADATA[bare]
+    return EXPECTED_METADATA.get(parts[-1])
+
+
 class Divergence(Exception):
     def __init__(self, field, batch, sequential, source_key=None):
         self.field = field
@@ -98,14 +153,28 @@ def _close(left, right, tolerance):
         return left == right
 
 
+# Differences excused as provenance, recorded so they can be reported.
+EXCUSED = []
+STRICT_METADATA = False
+
+
+def _record_or_raise(field, left, right, source_key):
+    """Data differences raise; metadata differences are recorded and excused."""
+    reason = None if STRICT_METADATA else metadata_reason(field)
+    if reason is None:
+        raise Divergence(field, left, right, source_key)
+    EXCUSED.append({"field": field, "batch": left, "sequential": right,
+                    "reason": reason})
+
+
 def _exact(field, left, right, source_key=None):
     if left != right:
-        raise Divergence(field, left, right, source_key)
+        _record_or_raise(field, left, right, source_key)
 
 
 def _approx(field, left, right, tolerance, source_key=None):
     if not _close(left, right, tolerance):
-        raise Divergence(field, left, right, source_key)
+        _record_or_raise(field, left, right, source_key)
 
 
 # -----------------------------------------------------------------------------
@@ -155,6 +224,10 @@ def compare(batch_dir, sequential_dir, tolerance):
     for note in notes:
         print("  note: %s" % note)
     print("")
+
+    # Find provenance differences up front, so the report can say what it
+    # excused instead of leaving those fields unexamined.
+    sweep_metadata(batch, sequential)
 
     # ---- 2. master camera -------------------------------------------------
     _exact("master_camera", batch.get("master_camera"),
@@ -277,6 +350,44 @@ def compare(batch_dir, sequential_dir, tolerance):
               % (bool(batch_report), bool(sequential_report)))
 
 
+def sweep_metadata(batch, sequential, prefix=""):
+    """Actively look for provenance differences and record them.
+
+    Without this the excused fields would merely be absent from the comparison,
+    which is indistinguishable from not having checked. Walking both documents
+    and reporting every name-matched metadata difference makes the policy
+    auditable: an operator sees exactly what was excused and why.
+    """
+    if isinstance(batch, dict) and isinstance(sequential, dict):
+        for key in sorted(set(batch) | set(sequential)):
+            field = "%s.%s" % (prefix, key) if prefix else key
+            left, right = batch.get(key), sequential.get(key)
+            if metadata_reason(field) is not None:
+                if left != right:
+                    _record_or_raise(field, left, right, None)
+                continue
+            sweep_metadata(left, right, field)
+    elif isinstance(batch, list) and isinstance(sequential, list):
+        for index, (left, right) in enumerate(zip(batch, sequential)):
+            sweep_metadata(left, right, "%s[%d]" % (prefix, index))
+
+
+def _print_excused():
+    """Show every excused difference, so nothing is hidden by the policy."""
+    if not EXCUSED:
+        print("  expected metadata differences: none")
+        print("")
+        return
+    print("EXPECTED METADATA DIFFERENCES (%d) -- excused, not data"
+          % len(EXCUSED))
+    print("-" * 78)
+    for entry in EXCUSED:
+        print("  %-34s %s" % (entry["field"], entry["reason"]))
+        print("      batch      : %r" % (entry["batch"],))
+        print("      sequential : %r" % (entry["sequential"],))
+    print("")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="scripts/parity_diff.py",
@@ -287,7 +398,14 @@ def main(argv=None):
     parser.add_argument("--tolerance", type=float, default=1e-6,
                         help="float tolerance (default 1e-6); ids, counts, "
                              "orderings and flags are always exact")
+    parser.add_argument("--strict-metadata", action="store_true",
+                        help="treat timestamps, paths, durations and run ids "
+                             "as data too, so every difference is reported")
     args = parser.parse_args(argv)
+
+    global STRICT_METADATA
+    STRICT_METADATA = args.strict_metadata
+    del EXCUSED[:]
 
     print("=" * 78)
     print("BATCH vs SEQUENTIAL parity")
@@ -295,11 +413,15 @@ def main(argv=None):
     print("  batch      : %s" % args.batch)
     print("  sequential : %s" % args.sequential)
     print("  tolerance  : %g (floats only)" % args.tolerance)
+    print("  metadata   : %s"
+          % ("STRICT -- provenance counts as data" if args.strict_metadata
+             else "provenance excused (timestamps, paths, durations, run ids)"))
     print("")
 
     try:
         compare(args.batch, args.sequential, args.tolerance)
     except Divergence as divergence:
+        _print_excused()
         print("FIRST DIVERGENCE")
         print("-" * 78)
         print("  field      : %s" % divergence.field)
@@ -312,7 +434,8 @@ def main(argv=None):
         print("a gap-count difference is usually a master-camera difference.")
         return 1
 
-    print("PARITY OK -- every compared field is identical "
+    _print_excused()
+    print("PARITY OK -- every compared DATA field is identical "
           "(floats within %g)" % args.tolerance)
     return 0
 

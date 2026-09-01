@@ -293,18 +293,29 @@ def test_feature_resolution_reuses_the_batch_contract():
         assert "FEATURES_ALL_KEYWORD" not in text
 
 
-def test_sequential_never_widens_the_selection(tmp_path):
-    """`features_for_camera` may narrow per camera, never add."""
-    selected = ("door", "load", "damage")
-    for camera_id in C.ALL_CAMERAS:
-        chosen = camera_runner.features_for_camera(camera_id, selected)
-        assert set(chosen) <= set(selected), camera_id
-        assert "ocr" not in chosen
+def test_sequential_never_widens_the_selection():
+    """The selection reaching Global Assembly is exactly what was asked for.
 
-    # OCR only appears when it was actually selected.
-    with_ocr = camera_runner.features_for_camera(
-        C.CAMERA_RIGHT_UP, ("door", "ocr"))
-    assert "ocr" in with_ocr
+    MIGRATED: `camera_runner.features_for_camera` no longer exists. Per-camera
+    narrowing was part of camera-local feature inference, which moved to Global
+    Assembly so Batch's own processors and wagon cache do the work. The
+    selection is now carried whole from the CLI to `_run_features`, so that is
+    where "never widened" is checked.
+    """
+    import inspect
+
+    from sequential import global_assembly
+
+    selected = mr.parse_features("door,load,damage")
+    assert set(selected) == {"door", "load", "damage"}
+    assert "ocr" not in selected
+
+    # `_run_features` iterates Batch's four features and writes a DISABLED
+    # sentinel for anything not selected -- it can never add one.
+    source = inspect.getsource(global_assembly._run_features)
+    assert 'for name in ("load", "door", "ocr", "damage")' in source
+    assert "if name not in selected:" in source
+    assert "_mark_disabled(name)" in source
 
 
 def test_ocr_weight_is_not_even_fingerprinted_when_unselected(weights_dir,
@@ -319,16 +330,20 @@ def test_ocr_weight_is_not_even_fingerprinted_when_unselected(weights_dir,
     fingerprints = camera_runner._model_fingerprints(
         C.CAMERA_RIGHT_UP, recon_models_dir=weights_dir,
         feat_models_dir=str(feat_dir),
-        camera_features=camera_runner.features_for_camera(
-            C.CAMERA_RIGHT_UP, ("door", "load", "damage")))
+        features=("door", "load", "damage"))
 
     assert not any(key.endswith("_ocr") for key in fingerprints)
     assert "feature_door" in fingerprints
-    # the two counting weights for this camera are present and from weights_dir
-    assert fingerprints["classification_side"]["present"] is True
-    assert fingerprints["gap_right"]["present"] is True
-    assert os.path.dirname(fingerprints["gap_right"]["path"]) == \
-        os.path.abspath(weights_dir)
+
+    # MIGRATED: all FIVE counting weights are fingerprinted now, not the two
+    # for this camera. The engine's load_all_models validates the whole camera
+    # mapping and build_class_maps reads every loaded model, so the result
+    # depends on all five -- and a seal that ignored three of them would be
+    # reused after one of those weights changed.
+    for slot in sorted(gc_runner.MODEL_SLOTS):
+        assert fingerprints[slot]["present"] is True, slot
+        assert os.path.dirname(fingerprints[slot]["path"]) == \
+            os.path.abspath(weights_dir), slot
 
 
 def test_unselected_ocr_is_never_imported_in_a_fresh_process():

@@ -349,16 +349,32 @@ def test_side_cameras_use_side_and_top_cameras_use_top():
 
 
 def test_sequential_derives_the_key_from_the_engine_map_not_the_camera_id():
-    """No camera-id-derived key may remain in the loading path."""
+    """No camera-id-derived key may remain anywhere in the loading path.
+
+    MIGRATED: the per-camera key lookup is no longer Sequential's to do. The
+    camera stage hands the engine ALL five weights and calls the engine's own
+    `camera_pipeline.process_camera`, which consults the engine's `camera_map`
+    itself -- the same way Batch does. So the assertion moved from "Sequential
+    reads camera_map correctly" to "Sequential does not choose at all", which
+    is the stronger form of the same guarantee.
+    """
     import inspect
 
     source = inspect.getsource(camera_runner.process_camera)
-    assert "camera_map.CAMERA_CLASSIFICATION_MODEL[camera_key]" in source
-    assert "camera_map.CAMERA_GAP_MODEL[camera_key]" in source
-    # the old camera-id-derived selection must be gone
-    assert 'if camera_id in C.TOP_CAMERAS' not in source, (
-        "the classification key is being derived from the camera id again")
-    assert "C.CAMERA_RIGHT_UP_TOP: \"gap_top\"" not in source
+
+    # it delegates instead of selecting
+    assert "camera_pipeline.process_camera" in source
+    assert "models.load_all_models(" in source
+    assert "engine_model_registries(" in source
+
+    # and no camera-id-derived key survives anywhere in the module
+    module_source = inspect.getsource(camera_runner)
+    for banned in ("if camera_id in C.TOP_CAMERAS",
+                   'CAMERA_RIGHT_UP_TOP: "gap_top"',
+                   "CLASSIFICATION_MODEL[camera_key]",
+                   "CAMERA_GAP_MODEL[camera_key]"):
+        assert banned not in module_source, (
+            "the camera stage is picking models itself again: %s" % banned)
 
 
 def test_sequential_and_batch_build_the_same_registries(weights):
@@ -377,13 +393,28 @@ def test_sequential_and_batch_build_the_same_registries(weights):
     assert sequential_gap == batch_gap
 
 
-def test_decode_uses_this_cameras_key_only(weights):
-    """All five are loaded, but a camera infers with its own pair only."""
+def test_the_engine_receives_every_key_its_camera_map_requires(weights):
+    """All five weights go in, under the engine's own key names.
+
+    OBSOLETE AS WRITTEN: this asserted against `camera_runner._decode_once`,
+    which is gone -- the camera stage does not decode or infer any more. What
+    still matters is that the registries handed to `load_all_models` cover the
+    ENTIRE camera mapping, because the engine validates all of it at load time
+    and raises otherwise. That EC2 failure was:
+      RuntimeError: Classification model(s) required by the camera mapping are
+      not loaded: ['side']
+    """
+    classification, gap = camera_runner.engine_model_registries(weights)
+
+    # every key the engine's camera_map can ask for, for ANY camera
+    assert set(classification) == {"side", "top"}
+    assert set(gap) == {"left", "right", "top"}
+
+    # and Sequential never singles one out
     import inspect
 
-    source = inspect.getsource(camera_runner._decode_once)
-    assert "CLASSIFICATION_MODELS[classification_key]" in source
-    assert "GAP_MODELS[gap_key]" in source
-    # no camera loads or uses the other camera's models
-    assert "CLASSIFICATION_MODELS[\"side\"]" not in source
-    assert "CLASSIFICATION_MODELS[\"top\"]" not in source
+    module_source = inspect.getsource(camera_runner)
+    for banned in ('CLASSIFICATION_MODELS["side"]',
+                   'CLASSIFICATION_MODELS["top"]',
+                   'GAP_MODELS["right"]', 'GAP_MODELS["top"]'):
+        assert banned not in module_source, banned
