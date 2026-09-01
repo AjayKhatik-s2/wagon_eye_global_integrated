@@ -10,10 +10,15 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from . import constants as C
+
+#: The site's zone.  Filename timestamps are IST wall-clock (see `age_seconds`).
+#: Defined locally rather than imported from `core.config` so this module stays
+#: importable without the config layer, as it has always been.
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # -----------------------------------------------------------------------------
@@ -31,6 +36,7 @@ class CameraVideo:
     train_timestamp: str        # YYYYMMDD_HHMMSS
     file_size: int = 0
     last_modified: Optional[datetime] = None
+    etag: Optional[str] = None  # S3 ETag (source version); None in local mode
 
 
 # -----------------------------------------------------------------------------
@@ -53,10 +59,21 @@ class TrainBatch:
         return not self.missing_cameras()
 
     def age_seconds(self) -> float:
-        """Seconds since the batch's train_timestamp (UTC)."""
+        """Seconds since the batch's train_timestamp.
+
+        The filename digits are **IST wall-clock**, not UTC: the upstream
+        trimmer writes them that way and names each trimmed clip after its raw
+        basename.  Labelling them UTC makes every batch look 5h30m in the
+        FUTURE, so this returns about -19,500 s and
+        `train_batch_manager.select_runnable_batch`'s
+        `age_seconds() >= partial_wait` gate can never be satisfied -- a 2- or
+        3-camera train is held back for ~5.4 hours instead of the intended 30
+        minutes.  There was no consumer of this method before S3 discovery
+        existed, so correcting the zone changes nothing that previously ran.
+        """
         try:
             t = datetime.strptime(self.train_timestamp, "%Y%m%d_%H%M%S")
-            t = t.replace(tzinfo=timezone.utc)
+            t = t.replace(tzinfo=_IST)
         except ValueError:
             return 0.0
         return (datetime.now(timezone.utc) - t).total_seconds()

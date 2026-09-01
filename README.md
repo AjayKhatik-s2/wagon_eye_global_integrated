@@ -335,7 +335,10 @@ camera_..._5_RIGHT_TOP_...mp4    -> RIGHT_UP_TOP
 camera_..._6_LEFT_TOP_...mp4     -> LEFT_UP_TOP
 ```
 
-S3 input lives under `s3://complete-train2/new_local/`; `--auto` polls it.
+S3 input lives in `$WAGONEYE_S3_INPUT_BUCKET` (default: the trimmed-clip
+bucket `biputri-wagon-pre-processed-video`), under the four camera folders in
+`core/constants.py: CAMERA_S3_FOLDER`. `--auto` polls it; `--historical`
+replays a time range out of it.
 
 ### 4. Preflight
 
@@ -373,7 +376,7 @@ or `--features ocr`.
 
 ```bash
 BATCH=$(ls -1t batch_outputs | head -1)
-aws s3 cp batch_outputs/$BATCH/reports/     s3://complete-train2/new_local/$BATCH/reports/ --recursive     --exclude "*" --include "*.pdf" --include "*.json"
+aws s3 cp batch_outputs/$BATCH/reports/     s3://$WAGONEYE_S3_OUTPUT_BUCKET/train_batch/$BATCH/reports/ --recursive     --exclude "*" --include "*.pdf" --include "*.json"
 ```
 
 Or drop `--skip-upload` to let Stage 6 deliver.

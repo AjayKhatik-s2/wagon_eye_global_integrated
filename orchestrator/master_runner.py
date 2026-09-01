@@ -6,6 +6,8 @@ Run modes:
     python -m orchestrator.master_runner --once         # one batch, exit
     python -m orchestrator.master_runner --batch <key>  # replay a specific batch
     python -m orchestrator.master_runner --local-only --local-inputs DIR
+    python -m orchestrator.master_runner --historical --date YYYY-MM-DD \
+            --start-time HH:MM --end-time HH:MM      # replay a time range
 
 Pipeline (per batch):
     Stage 1  reconstruction.runner.run     -> GlobalTrainState
@@ -18,6 +20,8 @@ Pipeline (per batch):
     Stage 4  fusion.wagon_state_builder.build
     Stage 5  reporting.combined_train_report.build
     Stage 6  delivery.{s3_upload, notification}
+    Stage 6b delivery.dashboard_ingest        -> 4 per-camera documents
+    Stage 6c delivery.global_train_webhook    -> the fused report, inline
 
 There is NO legacy v3 fallback.  Stage-1 failure -> batch is marked
 failed_no_global_state and abandoned.
@@ -55,6 +59,7 @@ from core.batch import (
 from core.global_state_loader import (
     GlobalTrainState, assert_roster_unchanged, roster_fingerprint,
 )
+from core.logging_setup import setup_logging
 from core.stage_timing import StageTimer
 from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
@@ -64,6 +69,7 @@ from fusion import wagon_state_builder
 from reporting import combined_train_report, camera_reports
 from rendering import feature_overlay_renderer
 from delivery import s3_upload, notification
+from delivery import dashboard_ingest, finalization, global_train_webhook
 
 
 # -----------------------------------------------------------------------------
@@ -205,6 +211,9 @@ class BatchOutcome:
     processed_video_paths: Dict[str, str] = field(default_factory=dict)
     processed_video_urls:  Dict[str, str] = field(default_factory=dict)
     final_status: str = "unknown"
+    # Stage 6b / 6c delivery records (what the dashboard receivers answered).
+    dashboard: Dict[str, Any] = field(default_factory=dict)
+    global_ingest: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
     elapsed_seconds: float = 0.0
     # Per-stage wall clock; also persisted to archive/timings.json.
@@ -743,6 +752,72 @@ def process_batch(
           f"wagon_states={n_states} files, reports={n_reports} files, "
           f"evidence={n_evidence} files, processed_videos={n_videos} files")
 
+    # ---- Seed the finalization marker, so the documents carry their PDF links ----
+    # `dashboard_ingest` reads per-camera PDF URLs out of `<batch_root>/delivery/
+    # finalization.json`, because it works from FINISHED artifacts on disk and
+    # has no access to the URLs this function is holding in memory.  Without the
+    # marker every document publishes with `pdf_report_url` empty.  An existing
+    # marker is never overwritten -- whatever recorded a delivery first keeps its
+    # record.
+    try:
+        _urls = {f"camera_{cam}": u for cam, u in out.camera_pdf_urls.items() if u}
+        if out.report_pdf_url:
+            _urls["pdf"] = out.report_pdf_url
+        if out.report_json_url:
+            _urls["json"] = out.report_json_url
+        if _urls and finalization.load(batch_root) is None:
+            finalization.write(batch_root, {
+                "batch_key": batch.batch_key,
+                "terminal_status": out.final_status,
+                "upload_urls": _urls,
+                "uploaded": True,
+                "archived": {"global_state": n_state, "wagon_states": n_states,
+                             "reports": n_reports, "evidence": n_evidence,
+                             "processed_videos": n_videos},
+                "source": "orchestrator.master_runner",
+            })
+    except Exception as e:                       # noqa: BLE001
+        print(f"[STAGE6] could not seed the finalization marker: {e}",
+              file=sys.stderr)
+
+    # ---- Stage 6b: the per-camera dashboard feed ----
+    # Four documents, one per camera, each uploaded to the inspection bucket and
+    # then POSTed to the ingest receivers as {camera_id, inspection_s3_uri,
+    # version}.  It reads only FINISHED artifacts off `batch_root` -- the sealed
+    # GlobalTrainState, the fused per-wagon states and the evidence tree -- so it
+    # runs no model, opens no video and cannot change what this batch decided.
+    #
+    # Failure is never fatal: the report is written and archived by this point,
+    # and a receiver outage costs a dashboard row, not the inspection.
+    print(f"\n--- STAGE 6b  Dashboard ingest (per camera) ---")
+    try:
+        out.dashboard = dashboard_ingest.run(
+            batch_root=batch_root, s3_client=s3_client, skip_upload=False)
+        for cam, info in (out.dashboard.get("cameras") or {}).items():
+            print(f"  {cam:<13} {info.get('status')}"
+                  f"{'  run_id=' + str(info['run_id']) if info.get('run_id') else ''}")
+    except Exception as e:                       # noqa: BLE001
+        out.dashboard = {"error": str(e)}
+        print(f"[STAGE6b] dashboard ingest failed: {e}", file=sys.stderr)
+        traceback.print_exc()
+
+    # ---- Stage 6c: the fused global report ----
+    # ORDER MATTERS.  The receiver stores this document as a virtual FIFTH
+    # camera (GLOBAL_FUSED) that supersedes the four per-camera ones, so it has
+    # to arrive after them.  Unlike the per-camera endpoint this one takes the
+    # report INLINE (`global_train_data`), not an s3:// pointer, and it is
+    # de-duplicated on content -- a repost of an unchanged report answers
+    # `already_existed: true` rather than creating a second run.
+    print(f"\n--- STAGE 6c  Dashboard ingest (fused global report) ---")
+    try:
+        out.global_ingest = global_train_webhook.publish(
+            report_json_path=out.report_json_path or "",
+            batch_key=batch.batch_key).to_dict()
+    except Exception as e:                       # noqa: BLE001
+        out.global_ingest = {"error": str(e)}
+        print(f"[STAGE6c] global ingest failed: {e}", file=sys.stderr)
+        traceback.print_exc()
+
     if not skip_email:
         summary = summarize_wagons(list(out.unified.values()))
         notification.send_email(
@@ -762,24 +837,36 @@ def process_batch(
 
 
 # -----------------------------------------------------------------------------
-# Continuous mode (S3 polling).  This is a minimal placeholder: the
-# legacy `train_batch_manager.py` polling code can be plugged in here.
+# Continuous mode (S3 polling).  Stage-0 discovery lives in
+# `orchestrator.train_batch_manager`; this loop only decides WHICH batch to run
+# and hands it to `process_batch` unchanged.
 # -----------------------------------------------------------------------------
 
 def run_auto(*args, **kwargs):
     """Continuous S3 polling loop.  Lifts polling from the legacy
     train_batch_manager + processed_batches state file convention."""
+    # The S3-facing modules (train_batch_manager, historical_runner) report
+    # through `logging`, not `print`, because a daemon's output has to land in a
+    # rotated file as well as on the console.  Without a configured root logger
+    # every one of those lines is dropped.  Scoped to the two S3-facing entry
+    # points: --local-only and --mode sequential print as they always have, and
+    # attaching a root handler for them would only pull in third-party log noise.
+    setup_logging()
     try:
-        # legacy module sits at the repo root; not part of wagon_eye_v4/
-        sys.path.insert(0, os.path.dirname(_REPO_ROOT))
-        from train_batch_manager import (                        # type: ignore
+        # In-repo since the discovery port.  This used to reach OUTSIDE the repo
+        # (`sys.path.insert(0, dirname(_REPO_ROOT))` + a bare
+        # `from train_batch_manager import ...`) for a module that was never
+        # there, so --auto printed "continuous polling unavailable" and exited 3
+        # on every invocation.
+        from orchestrator.train_batch_manager import (
             poll_for_batches, select_runnable_batch,
             load_batch_state, save_batch_state,
             DEFAULT_BATCH_TOLERANCE_SEC,
         )
     except Exception as e:
         print(f"[ORCH] continuous polling unavailable -- "
-              f"train_batch_manager.py not importable: {e}", file=sys.stderr)
+              f"orchestrator.train_batch_manager not importable: {e}",
+              file=sys.stderr)
         return 3
 
     import boto3
@@ -813,6 +900,11 @@ def run_auto(*args, **kwargs):
                 s3_client=s3, processed_batches=processed,
                 start_time=start,
                 tolerance_sec=DEFAULT_BATCH_TOLERANCE_SEC,
+                # Live polling is bounded to the operational-day window so a
+                # first poll cannot queue the entire trimmed archive.  A
+                # `--batch <key>` replay deliberately reaches PAST that window:
+                # the whole point is to re-run a specific older train.
+                apply_cutoff=not bool(force_key),
             )
             if force_key:
                 batch = next((b for b in batches if b.batch_key == force_key), None)
@@ -996,6 +1088,91 @@ def run_local(
 
 
 # -----------------------------------------------------------------------------
+# Historical (time-range) mode -- an INPUT-SELECTION layer only.
+#
+# BATCH ONLY, by design.  `historical_runner.run` hands every discovered train
+# to `process_batch`, the same entry point --auto / --once / --local-only use.
+# The `sequential/` package is not imported, referenced or reachable from here.
+# -----------------------------------------------------------------------------
+
+def run_historical(args, *, feature_config=None, inference_opts=None) -> int:
+    """CLI adapter for `--historical`.
+
+    Resolves the requested window, opens an S3 client, and delegates to
+    `historical_runner.run`, which selects the matching already-trimmed clips and
+    feeds each discovered train to the SAME `process_batch` the live path uses.
+
+    Nothing in `run_auto` is entered: no polling loop, no live discovery cutoff,
+    and `processed_batches.json` is neither read nor written -- so a historical
+    run can neither be blocked by a live batch nor mark one terminal.
+    """
+    from orchestrator import historical_runner as HR
+    from orchestrator import train_batch_manager as TBM
+
+    # See run_auto: without this the whole manifest a --dry-run exists to show
+    # is logged into a root logger with no handlers, and the command prints
+    # nothing at all.
+    setup_logging()
+
+    # The requested window is parsed FIRST: it is pure and instant, so a typo in
+    # --date / --start-time is reported immediately rather than after a
+    # multi-second S3 round trip.
+    try:
+        window = HR.resolve_window(
+            date=args.date, start_time=args.start_time, end_time=args.end_time,
+            timezone_name=args.timezone, start_iso=args.start, end_iso=args.end,
+        )
+    except ValueError as e:
+        print(f"[HISTORICAL] {e}", file=sys.stderr)
+        return 2
+
+    # Fail fast on the two settings historical discovery cannot work without,
+    # instead of listing zero objects and reporting "no video matched".
+    problems = []
+    if not C.S3_INPUT_BUCKET:
+        problems.append("WAGONEYE_S3_INPUT_BUCKET is required for --historical")
+    if not C.S3_INPUT_PREFIXES:
+        problems.append("WAGONEYE_S3_INPUT_PREFIXES is empty -- historical "
+                        "discovery would find nothing")
+    if problems:
+        print("[HISTORICAL] refusing to start -- configuration errors:",
+              file=sys.stderr)
+        for problem in problems:
+            print(f"  * {problem}", file=sys.stderr)
+        return 2
+
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=C.S3_REGION)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HISTORICAL] could not create an S3 client: {e}", file=sys.stderr)
+        return 2
+
+    return HR.run(
+        s3_client=s3,
+        window=window,
+        workspace_root=args.workspace or DEFAULT_WORKSPACE_PARENT,
+        recon_models_dir=args.recon_models_dir or DEFAULT_RECON_MODELS_DIR,
+        feat_models_dir=args.feat_models_dir or DEFAULT_FEAT_MODELS_DIR,
+        feature_config=feature_config,
+        pad_minutes=(HR.DEFAULT_PAD_MINUTES if args.pad_minutes is None
+                     else args.pad_minutes),
+        tolerance_sec=(TBM.DEFAULT_BATCH_TOLERANCE_SEC
+                       if args.tolerance_sec is None else args.tolerance_sec),
+        dry_run=args.dry_run,
+        keep_inputs=args.keep_inputs,
+        deliver=args.historical_deliver,
+        # --historical-deliver turns on upload + dashboard ingest; email stays
+        # separately suppressible with the existing --skip-email, so a bulk
+        # re-run can reach the dashboard without mailing the operators N times.
+        send_email=not args.skip_email,
+        manifest_out=args.manifest_out,
+        inference_opts=inference_opts,
+        mode=MODE_BATCH,
+    )
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -1095,6 +1272,46 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
+
+    # ---- historical (time-range) mode --------------------------------------
+    # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3 clips
+    # fall in a requested time range and hands each resulting TrainBatch to the
+    # SAME `process_batch` the live path uses.  None of these flags is read by
+    # --auto / --once / --batch / --local-only; see historical_runner.py.
+    # Historical mode is BATCH ONLY -- `--mode sequential` does not apply to it.
+    hist = p.add_argument_group("historical mode (--historical)")
+    hist.add_argument("--historical", action="store_true",
+                      help="process already-trimmed S3 clips from a time range")
+    hist.add_argument("--date", default=None, help="YYYY-MM-DD")
+    hist.add_argument("--start-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--end-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--timezone", default=None,
+                      help="IANA zone for --date/--start-time/--end-time "
+                           "(default Asia/Kolkata)")
+    hist.add_argument("--start", default=None,
+                      help="ISO-8601 start, e.g. 2026-08-08T10:00:00+05:30 "
+                           "(alternative to --date/--start-time)")
+    hist.add_argument("--end", default=None, help="ISO-8601 end")
+    hist.add_argument("--tolerance-sec", type=int, default=None,
+                      help="seconds between two cameras' clips for them to be "
+                           "the same train (default 120, the live value).  Some "
+                           "days stamp the four cameras minutes apart -- check "
+                           "--dry-run and widen if batches come out partial")
+    hist.add_argument("--pad-minutes", type=float, default=None,
+                      help="how far past its filename timestamp a clip may still "
+                           "hold its train (default 15)")
+    hist.add_argument("--dry-run", action="store_true",
+                      help="discover + print the manifest; download nothing, "
+                           "run no inference")
+    hist.add_argument("--keep-inputs", action="store_true",
+                      help="keep staged clips after a successful batch")
+    hist.add_argument("--historical-deliver", action="store_true",
+                      help="enable S3 upload + dashboard ingest + email for "
+                           "historical batches (OFF by default so a re-run "
+                           "cannot overwrite or re-notify the live delivery)")
+    hist.add_argument("--manifest-out", default=None,
+                      help="path for the JSON manifest (default: "
+                           "<workspace>/historical/historical_manifest.json)")
     return p
 
 
@@ -1151,6 +1368,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(f"[ORCH] Execution mode: {mode.upper()}")
+
+    # ---- historical (time-range) mode --------------------------------------
+    # Dispatched BEFORE --local-only / --auto: it is a different input source,
+    # not a variation of either.  It always runs the BATCH pipeline, so an
+    # explicit `--mode sequential` is refused rather than silently ignored.
+    if args.historical:
+        if args.auto:
+            print("ERROR: --historical and --auto are mutually exclusive "
+                  "(one replays a time range, the other polls for new trains)",
+                  file=sys.stderr)
+            return 2
+        if args.local_only:
+            print("ERROR: --historical and --local-only are mutually exclusive "
+                  "(historical reads its clips from S3)", file=sys.stderr)
+            return 2
+        if mode != MODE_BATCH:
+            print(f"ERROR: --historical runs the BATCH pipeline only; "
+                  f"--mode {mode} does not apply to it.", file=sys.stderr)
+            return 2
+        return run_historical(args, feature_config=feature_config,
+                              inference_opts=inference_opts)
 
     if args.local_only:
         return run_local(

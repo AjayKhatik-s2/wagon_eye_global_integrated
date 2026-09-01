@@ -2,6 +2,32 @@
 
 from __future__ import annotations
 
+import os
+
+
+# -----------------------------------------------------------------------------
+# Environment overrides.
+#
+# Every operational value below (bucket, endpoint, region, recipient list) is
+# declared as `_env("WAGONEYE_<NAME>", <the value this file already had>)`, so a
+# deployment retargets the pipeline with an env file and NO source edit, while a
+# checkout with no environment at all behaves exactly as it did before.
+# -----------------------------------------------------------------------------
+
+def _env(name: str, default: str) -> str:
+    """Read a WAGONEYE_* override, falling back to the built-in default."""
+    val = os.getenv(name)
+    return val if val else default
+
+
+def _env_list(name: str, default: list) -> list:
+    """Comma/semicolon separated env override for a list-valued constant."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
 # -----------------------------------------------------------------------------
 # Cameras
 # -----------------------------------------------------------------------------
@@ -158,26 +184,168 @@ DAMAGE_OK      = "OK"
 DAMAGE_CLASSES_TOP = {"floor_damage", "inner_wall_damage"}
 DAMAGE_CLASSES_NEGATIVE = {"no_damage"}
 
+# PROBABLE (not confirmed) top damage.  The dashboard reports these separately
+# as `probable_damage_wagons` / `floor_dmg_probable_wagons` and must NOT count
+# them as confirmed damage.  The double underscore in `floor__probable_damage`
+# is the trained model's real class name, not a typo -- matching it exactly is
+# what makes probable damage reportable instead of silently unmapped.
+DAMAGE_CLASSES_PROBABLE = {"floor__probable_damage", "floor_probable_damage",
+                           "floor_dmg_probable"}
+
+
+def is_probable_damage(class_name: str) -> bool:
+    """True for a PROBABLE (not confirmed) top-damage class."""
+    return str(class_name or "").strip().lower() in DAMAGE_CLASSES_PROBABLE
+
 
 # -----------------------------------------------------------------------------
-# S3 + email -- preserved from the legacy master_runner constants so the
-# new package can drop in without operational changes.
+# Per-camera S3 layout.
+#
+# CANONICAL per-camera S3 folder (== the site's own `camera_id`).  SINGLE source
+# of truth: video discovery and the dashboard feed both resolve through here, so
+# a rig rename is a one-line edit.
 # -----------------------------------------------------------------------------
 
-S3_REGION = "ap-south-1"
-S3_OUTPUT_BUCKET = "biro-wagon-report-biro-copy"
-S3_TRAIN_BATCH_PREFIX = "train_batch"
-S3_STATE_KEY = "master_runner/processed_batches.json"
+CAMERA_S3_FOLDER = {
+    CAMERA_RIGHT_UP:     "camera_CCTV_HZBN_DHN_2_RIGHT_UP",
+    CAMERA_LEFT_UP:      "camera_CCTV_HZBN_DHN_1_LEFT_UP",
+    CAMERA_RIGHT_UP_TOP: "camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
+    CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
+}
 
-UPLOAD_API_URL = "https://reports-api.suvidhaen.com/api/upload-pdf"
-EMAIL_API_URL = (
-    "https://ms-pnr-location-notification-api.suvidhaen.com/"
-    "notification_microservice/send-email"
+#: Reverse lookup: S3 folder -> camera id.  The FOLDER is authoritative, because
+#: the rig writes it; a filename is whatever the uploader felt like.
+S3_FOLDER_TO_CAMERA = {v: k for k, v in CAMERA_S3_FOLDER.items()}
+
+#: Filename tokens that identify a camera, for keys whose folder is unknown.
+#:
+#: The site names its TOP rigs `RIGHT_TOP` / `LEFT_TOP` (see CAMERA_S3_FOLDER)
+#: but the canonical camera ids are RIGHT_UP_TOP / LEFT_UP_TOP.  Matching only
+#: on the canonical id silently fails for both top cameras: their clips resolve
+#: to no camera at all, get dropped at discovery, and every batch forms with
+#: just the two side cameras.
+#:
+#: Order matters at match time: LONGEST token first, so a `..._RIGHT_UP_TOP_...`
+#: name is not claimed by the shorter `right_up`.  This is the S3-key-facing
+#: twin of CAMERA_FILENAME_ALIASES above, which `core.batch.scan_local_video_dir`
+#: uses for the local-directory scan.
+CAMERA_FILENAME_TOKENS = {
+    "right_up_top": CAMERA_RIGHT_UP_TOP,
+    "left_up_top":  CAMERA_LEFT_UP_TOP,
+    "right_top":    CAMERA_RIGHT_UP_TOP,
+    "left_top":     CAMERA_LEFT_UP_TOP,
+    "right_up":     CAMERA_RIGHT_UP,
+    "left_up":      CAMERA_LEFT_UP,
+}
+
+
+def camera_from_key(key: str):
+    """Resolve a camera id from an S3 key (or a bare filename).  None if unknown.
+
+    Folder first (the rig writes it), then filename tokens.
+    """
+    if not key:
+        return None
+    k = key.replace("\\", "/")
+    for folder, cam in S3_FOLDER_TO_CAMERA.items():
+        if f"/{folder}/" in f"/{k}" or k.startswith(f"{folder}/"):
+            return cam
+    base = k.rsplit("/", 1)[-1].lower()
+    for token in sorted(CAMERA_FILENAME_TOKENS, key=len, reverse=True):
+        if token in base:
+            return CAMERA_FILENAME_TOKENS[token]
+    return None
+
+
+# -----------------------------------------------------------------------------
+# S3 + email.
+#
+# THE DEPLOYED ACCOUNT IS `biputri-*`.  Every default below names a bucket in
+# THAT account, so a box with no env file at all still reads and writes inside
+# the account it is credentialed for.  The previous account's names (`biro-*`,
+# `test-inspection-artifacts-sarva`) are deliberately absent: leaving one as a
+# default is how a misconfigured box silently publishes into -- or fails against
+# -- an account nobody is watching.
+#
+# Every value stays overridable with its WAGONEYE_* variable, so moving accounts
+# again is an env file, not a source edit.
+# -----------------------------------------------------------------------------
+
+S3_REGION = _env("WAGONEYE_S3_REGION", "ap-south-1")
+
+# Reports / evidence / archive.
+S3_OUTPUT_BUCKET = _env("WAGONEYE_S3_OUTPUT_BUCKET", "biputri-wagon-report")
+S3_TRAIN_BATCH_PREFIX = _env("WAGONEYE_S3_TRAIN_BATCH_PREFIX", "train_batch")
+S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY", "master_runner/processed_batches.json")
+
+# Raw CCTV.  Declared for completeness and for operator-facing summaries: this
+# package is a pure CONSUMER of already-trimmed clips (train extraction lives in
+# a separate service), so nothing here reads raw video.
+S3_RAW_VIDEO_BUCKET = _env("WAGONEYE_S3_RAW_VIDEO_BUCKET",
+                           "biputri-wagon-raw-video")
+
+# Trimmed per-camera train clips -- what `--auto` and `--historical` consume.
+# Defaulting the consumer to the trimmed bucket (not the report bucket) is what
+# makes discovery find videos with no env file at all.
+S3_TRIMMED_VIDEO_BUCKET = _env("WAGONEYE_S3_TRIMMED_VIDEO_BUCKET",
+                               "biputri-wagon-pre-processed-video")
+S3_INPUT_BUCKET = _env("WAGONEYE_S3_INPUT_BUCKET", S3_TRIMMED_VIDEO_BUCKET)
+
+# Prefixes discovery scans for source videos -- the four camera folders,
+# matching the trimmed-bucket layout the extractor writes.
+S3_INPUT_PREFIXES = _env_list(
+    "WAGONEYE_S3_INPUT_PREFIXES",
+    [CAMERA_S3_FOLDER[c] for c in ALL_CAMERAS],
 )
-PRODUCT_NAME = "CCTV-WagonEye-CombinedReports"
 
-EMAIL_RECEIVER = ["atul.nitt.cse@gmail.com"]
-EMAIL_RECEIVER_CC = [
+# Where the per-camera inspection JSON is uploaded.  The dashboard ingest API is
+# handed an `s3://` URI into this bucket and FETCHES the document from there.
+#
+# It DERIVES from S3_OUTPUT_BUCKET rather than naming a bucket of its own, and
+# that is deliberate.  A standalone default is the one value an operator has no
+# reason to think about -- it is not in the deployment's bucket list -- so it
+# survives an account migration untouched and the feed keeps addressing the old
+# account, which is exactly what happened with the previous
+# `test-inspection-artifacts-sarva`.  Derived, it moves with the account by
+# construction.  Set WAGONEYE_ARTIFACT_BUCKET (or the more specific
+# WAGONEYE_INSPECTION_JSON_BUCKET, read by delivery.dashboard_ingest) when the
+# backend designates a dedicated bucket -- and note the RECEIVER must have read
+# access to whichever bucket this ends up being.
+S3_ARTIFACT_BUCKET = _env("WAGONEYE_ARTIFACT_BUCKET", S3_OUTPUT_BUCKET)
+
+# -----------------------------------------------------------------------------
+# Dashboard ingest endpoints.
+#
+# Both hosts serve the SAME path -- the `version` field inside the document, not
+# the URL, is what selects the dashboard tab.
+# -----------------------------------------------------------------------------
+
+INGEST_API_URL_PROD = _env(
+    "WAGONEYE_INGEST_API_URL_PROD",
+    "https://ms-pnr-location-notification-api.suvidhaen.com/"
+    "cctv-receiver/inspections/ingest",
+)
+
+INGEST_API_URL_UAT = _env(
+    "WAGONEYE_INGEST_API_URL_UAT",
+    "https://cctv-wagon-uat-api.suvidhaen.com/inspections/ingest",
+)
+
+# The `version` value carried in each per-camera inspection document.  The
+# dashboard chooses which tab renders the report from this: "v1" -> V1 tab.
+INSPECTION_VERSION = _env("WAGONEYE_INSPECTION_VERSION", "v1")
+
+UPLOAD_API_URL = _env("WAGONEYE_UPLOAD_API_URL",
+                      "https://reports-api.suvidhaen.com/api/upload-pdf")
+EMAIL_API_URL = _env(
+    "WAGONEYE_EMAIL_API_URL",
+    "https://ms-pnr-location-notification-api.suvidhaen.com/"
+    "notification_microservice/send-email",
+)
+PRODUCT_NAME = _env("WAGONEYE_PRODUCT_NAME", "CCTV-WagonEye-CombinedReports")
+
+EMAIL_RECEIVER = _env_list("WAGONEYE_EMAIL_RECEIVER", ["atul.nitt.cse@gmail.com"])
+EMAIL_RECEIVER_CC = _env_list("WAGONEYE_EMAIL_RECEIVER_CC", [
     "Shivank.kumar.s2.s2@gmail.com",
     "rithish.sheru.s2@gmail.com",
     "omarbil01.s2@gmail.com",
@@ -188,7 +356,7 @@ EMAIL_RECEIVER_CC = [
     "rajchaudhary01.official@gmail.com",
     "shyambabugupt.s2@gmail.com",
     "contact@suvidhaen.com",
-]
+])
 
 
 # -----------------------------------------------------------------------------

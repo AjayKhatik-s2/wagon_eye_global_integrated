@@ -27,6 +27,8 @@ wagoneye.env
 
 # --- Runtime logs / reports ----------------------------------------------
 *.log
+# core.logging_setup writes the rotating pipeline log here (WAGONEYE_LOG_DIR).
+logs/
 *.pdf
 wagon_cache/
 wagon_states/
