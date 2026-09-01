@@ -427,3 +427,35 @@ def test_historical_does_not_print_the_generic_mode_line(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Execution mode:" not in out
     assert "Historical pipeline mode: SEQUENTIAL" in out
+
+
+# -----------------------------------------------------------------------------
+# The final summary must not crash a delivered run
+# -----------------------------------------------------------------------------
+
+def test_summary_only_reads_fields_camera_run_result_actually_has():
+    """The verbose summary printed every field it names.
+
+    `result.observation_count` did not exist, so the LAST statement of a
+    successful run raised AttributeError -- after `_deliver()` had already
+    uploaded and ingested. Historical mode then marked a fully delivered train
+    as a failed batch. Any field named in that block must exist on the
+    dataclass.
+    """
+    import inspect
+    import re
+
+    from sequential import runner as seq_runner
+    from sequential.camera_runner import CameraRunResult
+
+    src = inspect.getsource(seq_runner.run_sequential)
+    tail = src[src.index('for result in outcome.cameras:'):]
+    named = set(re.findall(r"\bresult\.([a-z_]+)\b", tail))
+    available = set(CameraRunResult.__dataclass_fields__) | {
+        name for name, val in vars(CameraRunResult).items()
+        if isinstance(val, property)
+    }
+    missing = named - available
+    assert not missing, (
+        "run_sequential's summary reads %s, which CameraRunResult does not have"
+        % sorted(missing))

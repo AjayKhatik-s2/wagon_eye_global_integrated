@@ -376,9 +376,14 @@ def run_sequential(
     if verbose:
         print("-" * 78)
         for result in outcome.cameras:
-            print("[SEQ] %-14s %-8s gaps=%-3d observations=%-6d %s"
+            # No observation count here: `CameraRunResult` has no such field,
+            # and the one written into the seal is hardcoded to 0 -- it is never
+            # tracked.  Reading it raised AttributeError and killed the run at
+            # the very last statement, AFTER delivery had already succeeded, so
+            # a fully delivered train was reported as a failed batch.  Printing
+            # a hardcoded zero instead would just be a quieter lie.
+            print("[SEQ] %-14s %-8s gaps=%-3d %s"
                   % (result.camera_id, result.status, result.unique_gap_count,
-                     result.observation_count,
                      "(resumed)" if result.reused else ""))
         assembly = outcome.assembly
         if assembly and assembly.ready:
