@@ -127,11 +127,20 @@ class GlobalFusedPayload(unittest.TestCase):
         self.assertEqual(body["upload_timestamp"], EXPECTED)
 
     def test_payload_still_carries_the_document_inline(self):
-        """The pre-existing contract must be untouched."""
+        """The pre-existing contract must be untouched.
+
+        `version` joined the payload deliberately: it selects the dashboard TAB,
+        the per-camera POSTs have always carried it, and without it nothing told
+        the receiver which tab the global document belonged to while its four
+        siblings were filed under v1.  Pinned here so a FIFTH key cannot arrive
+        unnoticed -- which is what this exact-key assertion is for.
+        """
         self._publish()
         _url, body = self.req.posts[0]
         self.assertEqual(sorted(body),
-                         ["camera_id", "global_train_data", "upload_timestamp"])
+                         ["camera_id", "global_train_data", "upload_timestamp",
+                          "version"])
+        self.assertEqual(body["version"], "v1")
         self.assertEqual(body["camera_id"], "GLOBAL_FUSED")
         self.assertEqual(body["global_train_data"]["batch_key"], BATCH)
         self.assertEqual(len(body["global_train_data"]["wagons"]), 59)

@@ -265,6 +265,23 @@ def publish(
         return res
 
     body = {"camera_id": res.camera_id, "global_train_data": doc}
+    # `version` is the DASHBOARD TAB selector -- "v1" puts a report in the V1
+    # tab. The per-camera POST has always carried it; this one did not, so
+    # nothing told the receiver which tab the global document belongs to while
+    # its four per-camera siblings were explicitly filed under v1.
+    #
+    # Read through dashboard_ingest's accessor rather than a second env lookup,
+    # so the global POST and the per-camera POSTs cannot disagree about the tab.
+    #
+    # NOT to be confused with `global_train_data["schema"]`
+    # ("wagon_eye.combined_report.v4"), which names the report FORMAT -- the V4
+    # report lineage -- and is not a tab. A V4-format report shown in the V1 tab
+    # is correct; they are different axes.
+    try:
+        from delivery.dashboard_ingest import _version as _tab_version
+        body["version"] = _tab_version()
+    except Exception:                                      # noqa: BLE001
+        pass
     # The train's own instant, not this process's. Omitted -- not guessed -- when
     # the batch key carries no timestamp, so the receiver's optional-field
     # fallback keeps its existing behaviour.
