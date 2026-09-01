@@ -11,6 +11,15 @@ Steps 1 and 2 already existed. Step 3 did not: the fused report reached S3 and
 stopped there, so the receiver's global endpoint would have stayed empty no
 matter how many trains ran.
 
+Which instant the run is filed under
+-----------------------------------
+`upload_timestamp` is the TRAIN's wall-clock instant, derived from the batch key,
+not the moment this process ran. Without it the receiver falls back to
+`datetime.utcnow()`, and a historical reprocess files the fused run under the day
+it was reprocessed -- so the dashboard's date filter cannot find it alongside the
+four per-camera runs, `RakeDispatchRecord.date` points at the wrong day, and
+`has_global_report` never flips for the train that actually ran.
+
 Why the whole document, not a pointer
 -------------------------------------
 The per-camera endpoint takes `{camera_id, inspection_s3_uri, version}` and
@@ -109,6 +118,44 @@ def global_ingest_urls() -> List[str]:
     return [_to_global(C.INGEST_API_URL_UAT)]
 
 
+#: The per-camera feed's own serialization -- `inspection_json.build_inspection_json`
+#: writes `upload_timestamp.strftime("%Y-%m-%dT%H:%M:%S")`. Matched EXACTLY so the
+#: five runs for one train (four cameras + GLOBAL_FUSED) carry the identical
+#: string, and no consumer has to reconcile two formats.
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+
+def train_upload_timestamp(batch_key: str) -> Optional[str]:
+    """The train's own wall-clock instant, as an IST-naive ISO string.
+
+    Why this has to be sent at all: `global_ingest.py` falls back to
+    `datetime.utcnow()` when the field is absent, so a historical train was
+    filed under the day it was REPROCESSED rather than the day it ran. The
+    per-camera feed never had the bug because it puts the timestamp inside the
+    document, which the receiver reads; the global endpoint takes it as a
+    request field, and we were not filling it in.
+
+    Derived through `dashboard_ingest.extract_train_timestamp` -- the same
+    function the per-camera path uses -- so the two cannot drift.
+
+    NAIVE, and deliberately so. `extract_train_timestamp` returns the filename
+    digits unshifted, documented as "train local/IST wall-clock", and the
+    per-camera documents publish exactly that. Converting to UTC here would
+    move the global run 5h30m away from its own four camera runs and, for a
+    train before 05:30 IST, onto the previous day.
+
+    Returns None when `batch_key` carries no parseable timestamp; the caller
+    then omits the field entirely and the receiver's existing optional-field
+    fallback applies, unchanged.
+    """
+    # Imported lazily, as `global_ingest_urls` above already does: the two
+    # modules are peers and neither should import the other at module scope.
+    from delivery.dashboard_ingest import extract_train_timestamp
+
+    ts = extract_train_timestamp(batch_key)
+    return ts.strftime(_TS_FORMAT) if ts is not None else None
+
+
 @dataclass
 class GlobalIngestResult:
     """What happened, per endpoint. Always returned; never raised."""
@@ -119,6 +166,7 @@ class GlobalIngestResult:
     camera_id: str = ""
     batch_key: str = ""
     wagons: int = 0
+    upload_timestamp: str = ""      # what was SENT; "" means the field was omitted
     per_endpoint: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -130,6 +178,7 @@ class GlobalIngestResult:
             "camera_id": self.camera_id,
             "batch_key": self.batch_key,
             "wagons": self.wagons,
+            "upload_timestamp": self.upload_timestamp,
             "per_endpoint": dict(self.per_endpoint),
         }
 
@@ -216,10 +265,17 @@ def publish(
         return res
 
     body = {"camera_id": res.camera_id, "global_train_data": doc}
+    # The train's own instant, not this process's. Omitted -- not guessed -- when
+    # the batch key carries no timestamp, so the receiver's optional-field
+    # fallback keeps its existing behaviour.
+    res.upload_timestamp = train_upload_timestamp(res.batch_key) or ""
+    if res.upload_timestamp:
+        body["upload_timestamp"] = res.upload_timestamp
     res.attempted = True
     if verbose:
-        log.info("%s posting %s (%d wagons) to %d endpoint(s)",
-                 _TAG, res.batch_key, res.wagons, len(urls))
+        log.info("%s posting %s (%d wagons) upload_timestamp=%s to %d endpoint(s)",
+                 _TAG, res.batch_key, res.wagons,
+                 res.upload_timestamp or "(omitted)", len(urls))
     for url in urls:
         r = _post(url, body, requests_mod=requests_mod)
         res.per_endpoint[url] = r
