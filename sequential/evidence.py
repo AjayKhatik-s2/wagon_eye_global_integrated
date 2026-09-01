@@ -35,8 +35,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from core import constants as C
 
-SCHEMA_VERSION = "wagon_eye.camera_evidence.v3"
-SEAL_SCHEMA_VERSION = "wagon_eye.camera_seal.v3"
+SCHEMA_VERSION = "wagon_eye.camera_evidence.v4"
+SEAL_SCHEMA_VERSION = "wagon_eye.camera_seal.v4"
 
 EVIDENCE_DIRNAME = "camera_evidence"
 CAMERA_REPORTS_DIRNAME = "camera_reports"
@@ -196,6 +196,12 @@ class CameraEvidence:
     feature_config: Dict[str, Any] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     snapshots: Dict[str, str] = field(default_factory=dict)
+    # The engine's OWN per-camera result, verbatim and lossless: exactly the
+    # fields `ga.build_normalized_timelines` and `gc_runner._harvest` read.
+    # Global Assembly rebuilds CAMERA_RESULTS from this and then calls the
+    # engine's global half, so the canonical train is computed by the same code
+    # Batch uses. See sequential/camera_runner.engine_record.
+    engine_result: Dict[str, Any] = field(default_factory=dict)
 
     def to_document(self) -> Dict[str, Any]:
         return {
@@ -211,6 +217,7 @@ class CameraEvidence:
             "feature_config": self.feature_config,
             "diagnostics": self.diagnostics,
             "snapshots": self.snapshots,
+            "engine_result": self.engine_result,
         }
 
     # ---- convenience -------------------------------------------------
@@ -240,6 +247,7 @@ def evidence_from_document(document: Dict[str, Any]) -> CameraEvidence:
         feature_config=dict(document.get("feature_config") or {}),
         diagnostics=dict(document.get("diagnostics") or {}),
         snapshots=dict(document.get("snapshots") or {}),
+        engine_result=dict(document.get("engine_result") or {}),
     )
 
 

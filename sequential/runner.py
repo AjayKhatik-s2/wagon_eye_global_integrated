@@ -96,6 +96,9 @@ def run_sequential(
     door_stride: int = 3,
     damage_stride: int = 3,
     load_stride: int = 2,
+    door_inference_mode: str = "sampled",
+    damage_inference_mode: str = "sampled",
+    load_inference_mode: str = "sampled",
     force_cameras: bool = False,
     skip_assembly: bool = False,
     verbose: bool = True,
@@ -186,9 +189,21 @@ def run_sequential(
         outcome.seconds = time.time() - started
         return outcome
 
+    # Global Assembly now runs Batch's Stages 2-5b, so it needs the feature
+    # selection, the feature weights and the inference options the CLI chose.
     outcome.assembly = global_assembly.assemble(
         workspace=workspace, repo_root=repo_root, batch_key=batch_key,
-        engine_dir=engine_dir, verbose=verbose)
+        engine_dir=engine_dir, feat_models_dir=feat_models_dir,
+        features=features,
+        inference_opts={
+            "door_inference_mode": door_inference_mode,
+            "door_sample_stride": door_stride,
+            "damage_inference_mode": damage_inference_mode,
+            "damage_sample_stride": damage_stride,
+            "load_inference_mode": load_inference_mode,
+            "load_sample_stride": load_stride,
+        },
+        verbose=verbose)
 
     outcome.seconds = time.time() - started
     if verbose:
