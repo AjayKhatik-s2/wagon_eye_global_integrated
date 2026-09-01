@@ -627,6 +627,23 @@ def build_inspection_json(*, camera: str, batch_root: str,
     if not _strip_prefix_enabled():
         doc["camera_id"] = folder
 
+    # The ORCHESTRATOR's batch key, top level beside `camera_id` and `version`,
+    # so the backend can correlate this camera's document with the other three
+    # and with the fused report by one exact-match field.
+    #
+    # It is `TrainBatch.batch_key` verbatim -- `combined_train_report` wrote it
+    # into the report as `batch_key`, and line ~575 above reads it straight back
+    # out. It is NOT re-derived from this camera's clip: the four cameras of one
+    # train are stamped up to several minutes apart, so a per-camera derivation
+    # would hand the backend four different keys for one train, which is exactly
+    # the correlation this field exists to provide.
+    #
+    # `upload_timestamp` inside `inspection_data` is deliberately left alone: it
+    # stays each camera's OWN instant, because that is what the receiver's
+    # +/-7-minute rake grouping consumes.
+    if batch_key:
+        doc["batch_key"] = batch_key
+
     # Provenance: which global_train run produced this document, and what this
     # camera was authoritative for.  Additive -- never replaces a V4 field.
     doc["inspection_data"]["_adapter"] = {

@@ -559,6 +559,18 @@ def process_batch(
         for cam, p in out.processed_video_paths.items()
     }
 
+    # Deterministic S3 prefix for the evidence tree, on the same principle as
+    # `_processed_video_url` above: Stage 5b names files Stage 6 has not uploaded
+    # yet, so the URL is CONSTRUCTED from `s3_upload.upload_tree`'s own key
+    # layout (<S3_TRAIN_BATCH_PREFIX>/<batch_key>/evidence/<rel>) rather than
+    # observed.  None when this run will not upload -- the report then omits the
+    # absolute-URL view entirely instead of promising objects that never land.
+    _evidence_url_base = (
+        None if skip_upload else
+        f"https://{C.S3_OUTPUT_BUCKET}.s3.{C.S3_REGION}.amazonaws.com/"
+        f"{C.S3_TRAIN_BATCH_PREFIX}/{batch.batch_key}/evidence"
+    )
+
     # Resolve logo asset (copied from old_system into the package)
     _logo_path = os.path.join(_PKG_DIR, "reporting", "assets", "Logo.jpeg")
     _per_camera_tracking_path = recon.per_camera_tracking_path
@@ -610,6 +622,7 @@ def process_batch(
                 },
                 processed_video_urls=out.processed_video_urls,
                 evidence_root=evidence_root,
+                evidence_url_base=_evidence_url_base,
                 wagon_states_root=states_root,
                 cache_root=cache_root,
                 missing_cameras=list(batch.missing_cameras()),
