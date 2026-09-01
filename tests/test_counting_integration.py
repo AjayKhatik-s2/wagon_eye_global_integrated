@@ -257,14 +257,25 @@ class TestCameraOffsetsReachMaterialization(unittest.TestCase):
                 _map_wagon_to_local_frames(w, t.fps, t.total_frames, delta),
                 f"{w.global_id}: renderer and materializer disagree")
 
-    def test_orchestrator_feeds_offsets_to_both_consumers(self):
+    def test_orchestrator_feeds_offsets_to_every_consumer(self):
+        """Every consumer that maps a wagon into a camera's frame space must be
+        handed the offsets.
+
+        Three of them now: the materializer (Stage 2), the overlay renderer
+        (Stage 4b) and the positional wagon-frame copy (Stage 4c). The third was
+        added with `core.wagon_frames`, and it needs them for exactly the reason
+        the materializer does -- it resolves the same per-camera frame window,
+        and a camera with a clock offset would otherwise be sampled at the wrong
+        indices and find no cached frame there.
+        """
         with open(os.path.join(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__))), "orchestrator",
                 "master_runner.py"), "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertEqual(src.count("camera_offsets=recon.camera_offsets"), 2,
-                         "camera offsets must reach BOTH the materializer "
-                         "(Stage 2) and the overlay renderer (Stage 4b)")
+        self.assertEqual(src.count("camera_offsets=recon.camera_offsets"), 3,
+                         "camera offsets must reach the materializer (Stage 2), "
+                         "the overlay renderer (Stage 4b) AND the wagon-frame "
+                         "copy (Stage 4c)")
 
     def test_unresolved_camera_falls_back_to_shared_t0(self):
         """An UNRESOLVED camera is never given a guessed shift."""

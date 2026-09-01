@@ -61,12 +61,14 @@ from core.global_state_loader import (
 )
 from core.logging_setup import setup_logging
 from core.stage_timing import StageTimer
+from core import wagon_frames
 from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
 from reconstruction import runner as reconstruction_runner
 from materializer import wagon_cache_builder
 from fusion import wagon_state_builder
 from reporting import combined_train_report, camera_reports
+from reporting import _evidence_lookup as ev_lookup
 from rendering import feature_overlay_renderer
 from delivery import s3_upload, notification
 from delivery import dashboard_ingest, finalization, global_train_webhook
@@ -575,6 +577,34 @@ def process_batch(
     _logo_path = os.path.join(_PKG_DIR, "reporting", "assets", "Logo.jpeg")
     _per_camera_tracking_path = recon.per_camera_tracking_path
 
+    # ---- Positional wagon frames -> evidence/ (before Stage 5 and Stage 6) ----
+    # Four frames per wagon per camera (start / mid1 / mid2 / end) copied out of
+    # wagon_cache into the evidence tree, so Stage 6's existing
+    # upload_tree(evidence_root, ...) carries them and the report can name a URL
+    # that genuinely gets uploaded.  wagon_cache itself is never uploaded, which
+    # is why a copy is needed rather than a link.
+    #
+    # Runs before Stage 5a/5b so the report has the manifest, and before Stage 6
+    # so the upload sees the files.  Failure is non-fatal: the reports are worth
+    # more than the gallery.
+    _wagon_frame_manifest: Dict[str, Any] = {}
+    try:
+        with timer.stage("stage4c_wagon_frames"):
+            _wagon_frame_manifest = wagon_frames.materialize(
+                state=recon.state,
+                cache_root=cache_root,
+                evidence_root=evidence_root,
+                per_camera_meta=ev_lookup.load_per_camera_meta(
+                    _per_camera_tracking_path),
+                camera_offsets=recon.camera_offsets,
+                verbose=verbose,
+            )
+        assert_roster_unchanged(recon.state, roster_guard,
+                                stage="Stage 4c (wagon frames)")
+    except Exception as e:                       # noqa: BLE001
+        print(f"[STAGE5] wagon-frame materialization failed (non-fatal): {e}",
+              file=sys.stderr)
+
     # ---- Stage 5a: camera-wise reports (legacy hierarchy; built first so
     # the combined report's DETAILED CAMERA REPORTS table can link them) ----
     print(f"\n--- STAGE 5a  Camera-wise reports ---")
@@ -623,6 +653,7 @@ def process_batch(
                 processed_video_urls=out.processed_video_urls,
                 evidence_root=evidence_root,
                 evidence_url_base=_evidence_url_base,
+                wagon_frames=_wagon_frame_manifest,
                 wagon_states_root=states_root,
                 cache_root=cache_root,
                 missing_cameras=list(batch.missing_cameras()),
