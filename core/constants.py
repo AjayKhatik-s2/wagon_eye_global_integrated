@@ -2,6 +2,33 @@
 
 from __future__ import annotations
 
+import os
+
+
+# -----------------------------------------------------------------------------
+# Environment overrides.
+#
+# Every operational value below (bucket, endpoint, region, recipient list) is
+# declared as `_env("WAGONEYE_<NAME>", <default>)`, so a deployment retargets the
+# pipeline with an env file and NO source edit.  Before this layer existed the
+# buckets were literals pointing at a previous AWS account, which meant a
+# correctly-credentialed box still uploaded into a bucket it could not see.
+# -----------------------------------------------------------------------------
+
+def _env(name: str, default: str) -> str:
+    """Read a WAGONEYE_* override, falling back to the built-in default."""
+    val = os.getenv(name)
+    return val if val else default
+
+
+def _env_list(name: str, default: list) -> list:
+    """Comma/semicolon separated env override for a list-valued constant."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
 # -----------------------------------------------------------------------------
 # Cameras
 # -----------------------------------------------------------------------------
@@ -158,26 +185,103 @@ DAMAGE_OK      = "OK"
 DAMAGE_CLASSES_TOP = {"floor_damage", "inner_wall_damage"}
 DAMAGE_CLASSES_NEGATIVE = {"no_damage"}
 
+# PROBABLE (not confirmed) top damage.  The dashboard reports these separately
+# and must NOT count them as confirmed damage.  The double underscore in
+# `floor__probable_damage` is the trained model's real class name, not a typo --
+# matching it exactly is what makes probable damage reportable instead of
+# silently unmapped.
+DAMAGE_CLASSES_PROBABLE = {"floor__probable_damage", "floor_probable_damage",
+                           "floor_dmg_probable"}
+
+
+def is_probable_damage(class_name: str) -> bool:
+    """True for a PROBABLE (not confirmed) top-damage class."""
+    return str(class_name or "").strip().lower() in DAMAGE_CLASSES_PROBABLE
+
 
 # -----------------------------------------------------------------------------
 # S3 + email -- preserved from the legacy master_runner constants so the
 # new package can drop in without operational changes.
 # -----------------------------------------------------------------------------
 
-S3_REGION = "ap-south-1"
-S3_OUTPUT_BUCKET = "biro-wagon-report-biro-copy"
-S3_TRAIN_BATCH_PREFIX = "train_batch"
-S3_STATE_KEY = "master_runner/processed_batches.json"
+# -----------------------------------------------------------------------------
+# Per-camera S3 layout.
+#
+# CANONICAL per-camera S3 folder (== the site's own `camera_id`).  SINGLE source
+# of truth: the dashboard feed resolves through here, so a rig rename is a
+# one-line edit.  Note the site names its TOP rigs RIGHT_TOP / LEFT_TOP even
+# though the canonical camera ids are RIGHT_UP_TOP / LEFT_UP_TOP.
+# -----------------------------------------------------------------------------
 
-UPLOAD_API_URL = "https://reports-api.suvidhaen.com/api/upload-pdf"
-EMAIL_API_URL = (
+CAMERA_S3_FOLDER = {
+    CAMERA_RIGHT_UP:     "camera_CCTV_HZBN_DHN_2_RIGHT_UP",
+    CAMERA_LEFT_UP:      "camera_CCTV_HZBN_DHN_1_LEFT_UP",
+    CAMERA_RIGHT_UP_TOP: "camera_CCTV_HZBN_DHN_5_RIGHT_TOP",
+    CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP",
+}
+
+#: Reverse lookup: S3 folder -> camera id.
+S3_FOLDER_TO_CAMERA = {v: k for k, v in CAMERA_S3_FOLDER.items()}
+
+
+# -----------------------------------------------------------------------------
+# S3 + email.
+#
+# THE DEPLOYED ACCOUNT IS `biputri-*`.  Every default names a bucket in THAT
+# account, so a box with no env file still reads and writes inside the account it
+# is credentialed for.  The previous account's `biro-*` names are deliberately
+# absent: leaving one as a default is how a misconfigured box silently uploads
+# into an account nobody is watching, which is exactly what happened before.
+# -----------------------------------------------------------------------------
+
+S3_REGION = _env("WAGONEYE_S3_REGION", "ap-south-1")
+S3_OUTPUT_BUCKET = _env("WAGONEYE_S3_OUTPUT_BUCKET", "biputri-wagoneye-report")
+S3_TRAIN_BATCH_PREFIX = _env("WAGONEYE_S3_TRAIN_BATCH_PREFIX", "train_batch")
+S3_STATE_KEY = _env("WAGONEYE_S3_STATE_KEY",
+                    "master_runner/processed_batches.json")
+
+# Where the per-camera inspection JSON is uploaded.  The dashboard ingest API is
+# handed an `s3://` URI into this bucket and FETCHES the document from there.
+#
+# It DERIVES from S3_OUTPUT_BUCKET rather than naming a bucket of its own: a
+# standalone default is the one value an operator has no reason to think about,
+# so it survives an account migration untouched and the feed keeps addressing the
+# old account.  Derived, it moves with the account by construction.  The RECEIVER
+# must have read access to whichever bucket this resolves to.
+S3_ARTIFACT_BUCKET = _env("WAGONEYE_ARTIFACT_BUCKET", S3_OUTPUT_BUCKET)
+
+# -----------------------------------------------------------------------------
+# Dashboard ingest endpoints.  Both hosts serve the SAME path -- the `version`
+# field inside the document, not the URL, selects the dashboard tab.
+# -----------------------------------------------------------------------------
+
+INGEST_API_URL_PROD = _env(
+    "WAGONEYE_INGEST_API_URL_PROD",
     "https://ms-pnr-location-notification-api.suvidhaen.com/"
-    "notification_microservice/send-email"
+    "cctv-receiver/inspections/ingest",
 )
-PRODUCT_NAME = "CCTV-WagonEye-CombinedReports"
 
-EMAIL_RECEIVER = ["atul.nitt.cse@gmail.com"]
-EMAIL_RECEIVER_CC = [
+INGEST_API_URL_UAT = _env(
+    "WAGONEYE_INGEST_API_URL_UAT",
+    "https://cctv-wagon-uat-api.suvidhaen.com/inspections/ingest",
+)
+
+# The `version` carried in each per-camera document; the dashboard chooses which
+# tab renders the report from this ("v1" -> the V1 tab).
+INSPECTION_VERSION = _env("WAGONEYE_INSPECTION_VERSION", "v1")
+
+UPLOAD_API_URL = _env("WAGONEYE_UPLOAD_API_URL",
+                      "https://reports-api.suvidhaen.com/api/upload-pdf")
+EMAIL_API_URL = _env(
+    "WAGONEYE_EMAIL_API_URL",
+    "https://ms-pnr-location-notification-api.suvidhaen.com/"
+    "notification_microservice/send-email",
+)
+PRODUCT_NAME = _env("WAGONEYE_PRODUCT_NAME", "CCTV-WagonEye-CombinedReports")
+
+EMAIL_RECEIVER = _env_list("WAGONEYE_EMAIL_RECEIVER",
+                           ["atul.nitt.cse@gmail.com"])
+EMAIL_RECEIVER_CC = _env_list("WAGONEYE_EMAIL_RECEIVER_CC", [
     "Shivank.kumar.s2.s2@gmail.com",
     "rithish.sheru.s2@gmail.com",
     "omarbil01.s2@gmail.com",
@@ -188,7 +292,7 @@ EMAIL_RECEIVER_CC = [
     "rajchaudhary01.official@gmail.com",
     "shyambabugupt.s2@gmail.com",
     "contact@suvidhaen.com",
-]
+])
 
 
 # -----------------------------------------------------------------------------

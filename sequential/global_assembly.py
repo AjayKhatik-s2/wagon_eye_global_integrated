@@ -195,6 +195,7 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
              features: Optional[Sequence[str]] = None,
              inference_opts: Optional[Dict[str, Any]] = None,
              cameras: Sequence[str] = C.ALL_CAMERAS,
+             evidence_url_base: Optional[str] = None,
              verbose: bool = True) -> AssemblyResult:
     """Build the canonical train and every final report, the Batch way."""
     if verbose:
@@ -342,6 +343,8 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
     # ---- Batch Stage 4 / 5a / 5b: the SAME builders and renderers --------
     from fusion import wagon_state_builder
     from reporting import camera_reports, combined_train_report
+    from reporting import _evidence_lookup as ev_lookup
+    from core import wagon_frames
 
     if verbose:
         print("[SEQ] STAGE 4  fusion (Batch's own)")
@@ -361,11 +364,36 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
     except Exception as exc:                                # pragma: no cover
         print("[SEQ/STAGE5a] camera reports FAILED: %s" % exc, file=sys.stderr)
 
+    # ---- positional wagon frames -> evidence/, BEFORE the report is built --
+    # The four per-camera frames (start / mid1 / mid2 / end) live only in
+    # wagon_cache, which is never uploaded.  Copying them into evidence/ puts
+    # them where the Stage-6 tree upload already mirrors, so the report can name
+    # a URL that genuinely gets uploaded.  This has to happen HERE, not in the
+    # runner: `combined_train_report.build` below SERIALIZES the report, so the
+    # manifest must exist before that call and not after `assemble()` returns.
+    #
+    # Additive -- nothing existing is moved or rewritten, and a failure costs the
+    # gallery rather than the report.
+    wagon_frame_manifest: Dict[str, Any] = {}
+    if evidence_url_base:
+        try:
+            wagon_frame_manifest = wagon_frames.materialize(
+                state=state, cache_root=cache_root,
+                evidence_root=evidence_root,
+                per_camera_meta=ev_lookup.load_per_camera_meta(tracking_path),
+                camera_offsets=state.camera_time_offsets(),
+                verbose=verbose)
+        except Exception as exc:                              # pragma: no cover
+            print("[SEQ/STAGE5] wagon-frame materialization failed "
+                  "(non-fatal): %s" % exc, file=sys.stderr)
+
     if verbose:
         print("[SEQ] STAGE 5b combined report (Batch's own renderer)")
     report = combined_train_report.build(
         state=state, unified=unified, output_dir=reports_root,
         batch_key=batch_key, evidence_root=evidence_root,
+        evidence_url_base=evidence_url_base,
+        wagon_frames=wagon_frame_manifest,
         wagon_states_root=states_root, cache_root=cache_root,
         camera_pdf_urls={camera: os.path.basename(path)
                          for camera, path in camera_report_paths.items()

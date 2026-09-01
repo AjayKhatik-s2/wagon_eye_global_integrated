@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
 from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
+from core import wagon_frames as _wf
 
 from . import _brand
 from . import _adapter
@@ -97,6 +98,176 @@ def _evidence_pages(evidence_root: Optional[str], wagons) -> Dict[str, Dict[str,
     return pages
 
 
+#: A door's own camera decides which of the two door snapshots is its evidence.
+#: Same convention `_evidence_pages` lists and `inspection_json._SIDE_GALLERY`
+#: publishes (`door/{side}_best.jpg`), so the URL names a file those already
+#: agree exists.
+_DOOR_SNAPSHOT_BY_CAMERA = {
+    C.CAMERA_LEFT_UP:  "left_best.jpg",
+    C.CAMERA_RIGHT_UP: "right_best.jpg",
+}
+
+
+def _door_s3_url(gw_id: str, camera_id: str, evidence_root: Optional[str],
+                 evidence_url_base: Optional[str]) -> Optional[str]:
+    """Absolute URL of this door's best snapshot, or None.
+
+    None -- never a fabricated URL -- whenever the claim cannot be made:
+      * no `evidence_url_base` (this run is not uploading, so no object will
+        exist at any URL we could name);
+      * a camera with no door snapshot convention (only the two SIDE cameras
+        photograph doors);
+      * the JPEG is absent from the local evidence tree.
+
+    That last check is a LOCAL stat, not an S3 call: Stage 5b runs before Stage 6
+    uploads, so S3 cannot be consulted, but `s3_upload.upload_tree` mirrors
+    `evidence/` verbatim -- whatever is on disk now is what lands under
+    `<prefix>/<batch_key>/evidence/`. Existence on disk is therefore the correct
+    and only available predicate.
+    """
+    if not evidence_url_base or not evidence_root:
+        return None
+    filename = _DOOR_SNAPSHOT_BY_CAMERA.get(str(camera_id or "").strip().upper())
+    if not filename:
+        return None
+    rel = f"{gw_id}/door/{filename}"
+    if not os.path.isfile(os.path.join(evidence_root, gw_id, "door", filename)):
+        return None
+    return f"{evidence_url_base.rstrip('/')}/{rel}"
+
+
+#: Top-damage class -> the `problem_type` the dashboard's own problem-frame
+#: vocabulary uses.  Taken from `delivery.inspection_json`, so the global report
+#: and the per-camera documents label the same defect the same way.
+_PROBLEM_TYPE_BY_CLASS = {
+    "floor_damage":            "floor_dmg",
+    "inner_wall_damage":       "inner_wall_dmg",
+    "floor__probable_damage":  "floor_dmg_probable",
+    "floor_probable_damage":   "floor_dmg_probable",
+    "floor_dmg_probable":      "floor_dmg_probable",
+}
+
+
+def _damage_problem_frames(
+    gw_id: str, wagon_index: int, evidence_root: Optional[str],
+    evidence_url_base: Optional[str],
+) -> List[Dict[str, Any]]:
+    """One entry per damage snapshot this wagon actually has on disk.
+
+    Built from `evidence/<GW>/damage/metadata.json`, which is the AUTHORITY for
+    which file is which: the damage processor writes one `tracks[]` record per
+    snapshot it saved, carrying that track's index, its owning camera, class,
+    confidence, best frame and bbox. Reading the metadata rather than pairing
+    `top_damage_details` positionally means a reordered or partially-written
+    detail list can never attach a picture to the wrong defect.
+
+    The snapshot filenames are camera-AMBIGUOUS on disk (`track_1.jpg`, not
+    `track_1__RIGHT_UP_TOP.jpg`), which is exactly why the camera is read from
+    the metadata and published alongside the URL -- the two top cameras
+    photograph the same roof, so a consumer that assumed an owner would show one
+    camera's damage under the other's name.
+
+    Shape mirrors the per-camera documents' `problem_frames[]`
+    (`delivery.inspection_json._problem_frame`) so a reader already parsing
+    those needs no second parser.
+
+    Empty -- never a fabricated URL -- when the run is not uploading, when there
+    is no metadata, or when the referenced JPEG is absent.
+    """
+    if not evidence_url_base or not evidence_root:
+        return []
+    meta_path = os.path.join(evidence_root, gw_id, "damage", "metadata.json")
+    if not os.path.isfile(meta_path):
+        return []
+    try:
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return []
+    base = evidence_url_base.rstrip("/")
+    out: List[Dict[str, Any]] = []
+    for track in (meta.get("tracks") or []):
+        if not isinstance(track, dict):
+            continue
+        try:
+            idx = int(track.get("track_idx"))
+        except (TypeError, ValueError):
+            continue
+        filename = "track_%d.jpg" % idx
+        if not os.path.isfile(os.path.join(evidence_root, gw_id, "damage",
+                                           filename)):
+            continue
+        cls = str(track.get("class_name") or "")
+        url = "%s/%s/damage/%s" % (base, gw_id, filename)
+        bbox = track.get("bbox")
+        conf = track.get("best_confidence", track.get("confidence"))
+        out.append({
+            "wagon_count":   wagon_index,
+            "global_id":     gw_id,
+            "camera_id":     track.get("camera_id"),
+            "segment_type":  "wagon",
+            "problem_type":  _PROBLEM_TYPE_BY_CLASS.get(cls.lower(), cls),
+            "frame_number":  track.get("best_frame_idx"),
+            "filename":      filename,
+            "s3_url":        url,
+            "is_annotated":  True,
+            "annotated_image_url": url,
+            "bounding_box": {
+                "coordinates": list(bbox) if isinstance(bbox, (list, tuple)) else None,
+                "confidence":  round(float(conf), 3) if conf is not None else None,
+                "class_name":  cls,
+            },
+        })
+    return out
+
+
+def _wagon_dicts_with_urls(
+    wagons, evidence_root: Optional[str], evidence_url_base: Optional[str],
+    wagon_frames: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """`[u.to_dict(), ...]` with the two S3-URL views added per wagon.
+
+      * `doors[].s3_url`   -- that door's own best snapshot;
+      * `wagon_frames`     -- `{angle: [{position, s3_url} x4]}`, the four
+        positional frames per camera angle, from the manifest the orchestrator
+        materialized into `evidence/`;
+      * `problem_frames`   -- one entry per damage snapshot, with the owning
+        camera read from the evidence metadata.
+
+    ADDITIVE, and applied to the SERIALIZED copy only: `UnifiedWagonState`,
+    `fusion.wagon_state_builder` and `features.door.processor` are untouched, so
+    the per-camera documents and the PDF see exactly what they saw before. Every
+    pre-existing wagon and door field is preserved.
+
+    Both views are omitted rather than faked: a door with no snapshot gets no
+    `s3_url`, and a wagon with no materialized frames gets no `wagon_frames`.
+    """
+    out: List[Dict[str, Any]] = []
+    for u in wagons:
+        wagon = u.to_dict()
+        doors = wagon.get("doors")
+        if isinstance(doors, list):
+            wagon["doors"] = [
+                (dict(d, s3_url=url)
+                 if isinstance(d, dict)
+                 and (url := _door_s3_url(u.global_id, d.get("camera_id"),
+                                          evidence_root, evidence_url_base))
+                 else d)
+                for d in doors
+            ]
+        frames = _wf.published(wagon_frames or {}, u.global_id,
+                               evidence_url_base)
+        if frames:
+            wagon["wagon_frames"] = frames
+        problems = _damage_problem_frames(
+            u.global_id, int(wagon.get("wagon_index") or 0),
+            evidence_root, evidence_url_base)
+        if problems:
+            wagon["problem_frames"] = problems
+        out.append(wagon)
+    return out
+
+
 def _build_json(
     *,
     state: GlobalTrainState,
@@ -106,6 +277,8 @@ def _build_json(
     processed_video_urls: Optional[Dict[str, str]] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
     evidence_root: Optional[str] = None,
+    evidence_url_base: Optional[str] = None,
+    wagon_frames: Optional[Dict[str, Any]] = None,
     legacy_view_model: Optional[_adapter.LegacyViewModel] = None,
 ) -> Dict[str, Any]:
     wagons_in_order = [unified[w.global_id] for w in state.wagons
@@ -127,7 +300,8 @@ def _build_json(
         "stage0_fallback_reason":  state.fallback_reason,
         "stage0_corrections_applied": list(state.corrections_applied),
         "per_camera_local_counts": dict(state.per_camera_local_counts),
-        "wagons": [u.to_dict() for u in wagons_in_order],
+        "wagons": _wagon_dicts_with_urls(wagons_in_order, evidence_root,
+                                         evidence_url_base, wagon_frames),
         "evidence_pages": _evidence_pages(evidence_root, wagons_in_order),
     }
     if legacy_view_model is not None:
@@ -1232,6 +1406,8 @@ def build(
     processed_video_urls: Optional[Dict[str, str]] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
     evidence_root: Optional[str] = None,
+    evidence_url_base: Optional[str] = None,
+    wagon_frames: Optional[Dict[str, Any]] = None,
     wagon_states_root: Optional[str] = None,
     cache_root: Optional[str] = None,
     missing_cameras: Optional[Sequence[str]] = None,
@@ -1262,6 +1438,8 @@ def build(
         processed_video_urls=processed_video_urls,
         extra_metadata=extra_metadata,
         evidence_root=evidence_root,
+        evidence_url_base=evidence_url_base,
+        wagon_frames=wagon_frames,
         legacy_view_model=vm,
     )
     json_path = os.path.join(output_dir, "combined_train_report.json")

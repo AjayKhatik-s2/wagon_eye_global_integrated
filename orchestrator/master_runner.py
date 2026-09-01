@@ -868,6 +868,8 @@ def _run_sequential_local(
     global_engine_dir: Optional[str],
     force_cameras: bool = False,
     skip_assembly: bool = False,
+    skip_upload: bool = True,
+    skip_email: bool = True,
 ) -> int:
     """Discover inputs, hand them to the Sequential architecture, report."""
     from sequential import runner as sequential_runner
@@ -903,6 +905,8 @@ def _run_sequential_local(
         load_inference_mode=str(options.get("load_inference_mode", "sampled")),
         force_cameras=force_cameras,
         skip_assembly=skip_assembly,
+        skip_upload=skip_upload,
+        skip_email=skip_email,
         verbose=True,
     )
 
@@ -929,6 +933,16 @@ def _run_sequential_local(
 # Local mode
 # -----------------------------------------------------------------------------
 
+def _real_s3():
+    """A live S3 client for a delivering local run.
+
+    Kept separate from `_NoopS3` so the choice is explicit at the call site: a
+    run that will not upload must never hold a client that could.
+    """
+    import boto3
+    return boto3.client("s3", region_name=C.S3_REGION)
+
+
 def run_local(
     *,
     local_inputs: str,
@@ -943,6 +957,8 @@ def run_local(
     mode: Optional[str] = None,
     force_cameras: bool = False,
     skip_assembly: bool = False,
+    skip_upload: bool = True,
+    skip_email: bool = True,
 ) -> int:
     if not os.path.isdir(local_inputs):
         print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
@@ -959,7 +975,8 @@ def run_local(
             recon_models_dir=recon_models_dir, feat_models_dir=feat_models_dir,
             feature_config=feature_config, inference_opts=inference_opts,
             global_engine_dir=global_engine_dir,
-            force_cameras=force_cameras, skip_assembly=skip_assembly)
+            force_cameras=force_cameras, skip_assembly=skip_assembly,
+            skip_upload=skip_upload, skip_email=skip_email)
 
     missing = [c for c in C.ALL_CAMERAS if c not in video_paths]
     if missing:
@@ -980,8 +997,12 @@ def run_local(
         batch=batch, workspace_root=workspace,
         recon_models_dir=recon_models_dir,
         feat_models_dir=feat_models_dir,
-        s3_client=_NoopS3(),
-        skip_upload=True, skip_email=True,
+        # A no-op client only when this run genuinely will not upload; a real
+        # one otherwise, so `--local-only` can deliver.  These were hardcoded
+        # True, which made the CLI flags decorative and left no path from local
+        # input to a real S3 upload.
+        s3_client=_NoopS3() if skip_upload else _real_s3(),
+        skip_upload=skip_upload, skip_email=skip_email,
         feature_config=feature_config or FeatureConfig.all_on(),
         global_engine_dir=global_engine_dir,
         stage1_engine=stage1_engine,
@@ -1170,6 +1191,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             mode=mode,
             force_cameras=args.force_cameras,
             skip_assembly=args.skip_assembly,
+            skip_upload=args.skip_upload,
+            skip_email=args.skip_email,
         )
 
     if not (args.auto or args.once or args.batch):
