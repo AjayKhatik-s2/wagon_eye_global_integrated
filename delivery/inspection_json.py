@@ -541,29 +541,33 @@ def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
         })
         if len(frames) >= len(POSITION_NAMES):
             break
-    if flavour == FLAVOUR_TOP and len(frames) < len(POSITION_NAMES):
-        # PAD a top camera's gallery out to four with its own positional frames.
-        #
-        # Filling an EMPTY gallery is the important half: LEFT_UP_TOP published
-        # nothing at all on a clean train (load's single fused frame belongs to
-        # RIGHT_UP_TOP, and damage yields nothing without damage), so its panel
-        # read NO DATA FOUND.
-        #
-        # Padding a PARTIAL one is the other half. RIGHT_UP_TOP publishes exactly
-        # one frame -- the fused load close-up -- so without this the two top
-        # panels show 4 and 1, which reads as one camera being broken. Both
-        # cameras have four of their own frames per wagon; there is no reason for
-        # one panel to be a quarter full.
-        #
-        # Curated frames are kept FIRST and never displaced: the load close-up is
-        # chosen for judging load state, while positional frames are evenly
-        # spaced samples. `position` is already a slot name rather than a
-        # semantic claim in this schema -- the side cameras publish
-        # `door/left_best.jpg` as "start" and `left_crop.jpg` as "mid1" -- so
-        # appending does not misdescribe anything.
-        #
-        # Side cameras are deliberately untouched: their galleries are what the
-        # dashboard has always shown, and nothing about them is broken.
+    # Two DIFFERENT rules, and conflating them is a regression in both
+    # directions -- gating everything on the top flavour left side-camera wagons
+    # with zero frames, and filling only empty galleries left the two top panels
+    # showing 4 images and 1.
+    #
+    #   EMPTY  -> fill, for ANY camera. A wagon with no frames renders blank, and
+    #             this camera's own four frames exist. LEFT_UP_TOP hit this on
+    #             every wagon of a clean train (load's single fused frame belongs
+    #             to RIGHT_UP_TOP, and damage yields nothing without damage), and
+    #             RIGHT_UP hits it on the wagons where no door was tracked.
+    #
+    #   PARTIAL -> pad to four, TOP cameras only. RIGHT_UP_TOP publishes exactly
+    #             one frame, the fused load close-up, so its panel was a quarter
+    #             full beside LEFT_UP_TOP's four. Side galleries are deliberately
+    #             left at whatever they have: two door frames is what the
+    #             dashboard has always shown for them and nothing is broken, so
+    #             padding them would be an unrequested change to a working view.
+    #
+    # Curated frames are kept FIRST and never displaced -- the load close-up is
+    # the frame the load processor chose for judging load state, and an evenly
+    # spaced sample is not a substitute. `position` is already a slot name rather
+    # than a semantic claim here (the side cameras publish `door/left_best.jpg`
+    # as "start" and `left_crop.jpg` as "mid1"), so appending misdescribes
+    # nothing.
+    want_more = (not frames) or (flavour == FLAVOUR_TOP
+                                 and len(frames) < len(POSITION_NAMES))
+    if want_more:
         have = {f["s3_url"] for f in frames}
         for extra in _own_positional_frames(evidence_root, gw_id, camera,
                                             url_for):

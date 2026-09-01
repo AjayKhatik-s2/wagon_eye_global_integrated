@@ -181,3 +181,58 @@ def test_side_cameras_are_not_padded(tmp_path):
                               IJ.FLAVOUR_SIDE, _url_for_factory(str(root)))
     assert len(frames) == 2
     assert all("/door/" in f["s3_url"] for f in frames)
+
+
+# -----------------------------------------------------------------------------
+# An EMPTY gallery is filled for ANY camera, side included
+# -----------------------------------------------------------------------------
+
+def test_a_side_camera_with_no_door_evidence_is_filled(tmp_path):
+    """RIGHT_UP had wagons with ZERO frames -- those panels render blank.
+
+    Gating the fill on the top flavour left them empty. A wagon with no frames is
+    strictly worse than one showing the camera's own footage, and that footage
+    exists, so the EMPTY case applies to every camera. This is distinct from
+    padding a PARTIAL side gallery, which is deliberately not done.
+    """
+    root = tmp_path / "evidence"
+    (root / "GW_1").mkdir(parents=True)
+    for n in (272, 285, 297, 310):
+        _write(str(root / "GW_1" / "wagon_frames" / "right_up"
+                   / ("w1_frame_%06d.jpg" % n)))
+    frames = IJ._wagon_frames(str(root), "GW_1", C.CAMERA_RIGHT_UP,
+                              IJ.FLAVOUR_SIDE, _url_for_factory(str(root)))
+    assert len(frames) == 4, "an empty side gallery was left empty"
+    assert all("/wagon_frames/right_up/" in f["s3_url"] for f in frames)
+
+
+def test_a_partial_side_gallery_is_still_not_padded(tmp_path):
+    """The other half of the rule: 2 door frames stay 2, not 4."""
+    root = tmp_path / "evidence"
+    for name in ("right_best.jpg", "right_crop.jpg"):
+        _write(str(root / "GW_1" / "door" / name))
+    for n in (272, 285, 297, 310):
+        _write(str(root / "GW_1" / "wagon_frames" / "right_up"
+                   / ("w1_frame_%06d.jpg" % n)))
+    frames = IJ._wagon_frames(str(root), "GW_1", C.CAMERA_RIGHT_UP,
+                              IJ.FLAVOUR_SIDE, _url_for_factory(str(root)))
+    assert len(frames) == 2
+    assert all("/door/" in f["s3_url"] for f in frames)
+
+
+def test_no_camera_ever_publishes_an_empty_gallery_when_frames_exist(tmp_path):
+    """The invariant, across all four cameras."""
+    root = tmp_path / "evidence"
+    (root / "GW_1").mkdir(parents=True)
+    angles = {C.CAMERA_RIGHT_UP: "right_up", C.CAMERA_LEFT_UP: "left_up",
+              C.CAMERA_RIGHT_UP_TOP: "right_top", C.CAMERA_LEFT_UP_TOP: "left_top"}
+    for angle in angles.values():
+        for n in (100, 110, 120, 130):
+            _write(str(root / "GW_1" / "wagon_frames" / angle
+                       / ("w1_frame_%06d.jpg" % n)))
+    url_for = _url_for_factory(str(root))
+    for cam, angle in angles.items():
+        frames = IJ._wagon_frames(str(root), "GW_1", cam,
+                                  IJ.flavour_for(cam), url_for)
+        assert frames, "%s published nothing" % cam
+        assert all("/%s/" % angle in f["s3_url"] for f in frames), cam
