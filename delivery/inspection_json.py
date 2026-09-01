@@ -54,7 +54,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from core import constants as C
 from core.evidence_identity import (
     damage_track_slot, legacy_damage_track_slot, load_best_frame_slot,
-    legacy_load_best_frame_slot)
+    legacy_load_best_frame_slot, parse_damage_track_slot)
 from core.logging_setup import get_logger
 
 log = get_logger("delivery.inspection_json")
@@ -415,6 +415,30 @@ _TOP_GALLERY = ("load/best_frame__{cam}.jpg",
 POSITION_NAMES = ("start", "mid1", "mid2", "end")
 
 
+def _damage_track_owner(evidence_root: str, gw_id: str,
+                        track_idx: int) -> Optional[str]:
+    """Which camera took ``damage/track_<idx>.jpg``, per the evidence metadata.
+
+    The damage processor records one entry per snapshot it wrote --
+    ``{"track_idx": i, "camera_id": ..., ...}`` in ``damage/metadata.json``
+    (features/damage/processor.py's ``track_meta``) -- so the owner of an
+    unscoped ``track_N.jpg`` is never a guess. Returns None when the file's
+    ownership cannot be established, and the caller must then publish nothing.
+    """
+    meta = _read_json(os.path.join(evidence_root, gw_id, "damage",
+                                   "metadata.json")) or {}
+    for track in (meta.get("tracks") or []):
+        if not isinstance(track, dict):
+            continue
+        try:
+            if int(track.get("track_idx")) == int(track_idx):
+                cam = track.get("camera_id")
+                return cam if isinstance(cam, str) and cam else None
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
                   flavour: str, url_for: Callable[..., Optional[str]]) -> List[Dict[str, Any]]:
     """``wagon_frames`` for one wagon: ``[{position, s3_url}, ...]``.
@@ -442,6 +466,28 @@ def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
             if (meta.get("source_camera") or meta.get("camera_id")) == camera:
                 url = url_for(gw_id=gw_id, feature=feature, camera=camera,
                               filename=f"{legacy_load_best_frame_slot()}.jpg")
+        if not url and feature == "damage":
+            # Exactly the same situation, and the same rule. The damage
+            # processor in this package writes `track_N.jpg`, not
+            # `track_N__<CAM>.jpg`, so a top camera asking for the camera-scoped
+            # name finds nothing and the gallery comes back EMPTY -- which is why
+            # top-camera wagons published no pictures at all while the side
+            # cameras published theirs.
+            #
+            # The owner is recorded, so this is a lookup rather than a guess:
+            # metadata.json's `tracks[].camera_id`. `_damage_track_url` (the
+            # problem-frames path) has always ended on this same legacy name and
+            # is why problem frames survived where the gallery did not; the
+            # difference is that it reaches the fallback only after
+            # `_project_camera_view` has already dropped other cameras' tracks,
+            # whereas the gallery is driven by filename templates and has no such
+            # filter -- hence the explicit ownership check here.
+            idx, _scoped_cam = parse_damage_track_slot(
+                os.path.splitext(filename)[0])
+            if (idx is not None
+                    and _damage_track_owner(evidence_root, gw_id, idx) == camera):
+                url = url_for(gw_id=gw_id, feature=feature, camera=camera,
+                              filename=f"{legacy_damage_track_slot(idx)}.jpg")
         if not url:
             continue
         frames.append({
