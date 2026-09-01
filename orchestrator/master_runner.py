@@ -1313,7 +1313,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    print(f"[ORCH] Execution mode: {mode.upper()}")
+    # Not printed for --historical: that path resolves its own mode below, and
+    # printing the generic one first puts a line reading "Execution mode: BATCH"
+    # directly above a SEQUENTIAL historical run in the log.
+    if not args.historical:
+        print(f"[ORCH] Execution mode: {mode.upper()}")
 
     if args.historical:
         # Historical mode's own default is SEQUENTIAL, but an EXPLICIT choice

@@ -410,3 +410,20 @@ def test_batch_age_is_anchored_to_ist():
     now_ist = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
     b = TrainBatch(batch_key=now_ist, train_timestamp=now_ist)
     assert -5 < b.age_seconds() < 120
+
+
+def test_historical_does_not_print_the_generic_mode_line(monkeypatch, capsys):
+    """`Execution mode: BATCH` must not appear above a SEQUENTIAL historical run.
+
+    The generic line reports `resolve_mode()`, which historical mode does not
+    use.  Printing both is how a log comes to say BATCH directly above a run that
+    was sequential.
+    """
+    from orchestrator import master_runner as MR
+    monkeypatch.delenv(MR.MODE_ENV_VAR, raising=False)
+    monkeypatch.setattr(MR, "run_historical", lambda args, **kw: 0)
+    MR.main(["--historical", "--date", "2026-07-24",
+             "--no-interactive", "--features", "door"])
+    out = capsys.readouterr().out
+    assert "Execution mode:" not in out
+    assert "Historical pipeline mode: SEQUENTIAL" in out
