@@ -275,7 +275,10 @@ REVERSAL_MIN_ERROR_IMPROVEMENT = 0.5
 
 GAP_TIMELINES = {}
 CAMERA_ALIGNMENTS = {}
+CAMERA_TIMELINE_INFO = {}
+CAMERA_GAP_COUNTS = {}
 MASTER_CAMERA = None
+MASTER_SELECTION_REASON = ""
 MASTER_TIMELINE = None
 MASTER_GAP_COUNT = 0
 MASTER_POSITIONS = None
@@ -283,6 +286,44 @@ MASTER_DURATIONS = None
 MASTER_GAP_ID_LIST = []
 GLOBAL_GAP_IDS = []
 GLOBAL_GAP_COUNT = 0
+
+
+def select_master_camera():
+    '''The engine's rule: most confirmed unique gaps, ties by CAMERAS order.'''
+    global MASTER_CAMERA, MASTER_SELECTION_REASON
+    from camera_map import CAMERAS
+
+    CAMERA_GAP_COUNTS.clear()
+    CAMERA_GAP_COUNTS.update(
+        {camera: CAMERA_TIMELINE_INFO[camera]['gap_count']
+         for camera in GAP_TIMELINES})
+    top = max(CAMERA_GAP_COUNTS.values()) if CAMERA_GAP_COUNTS else 0
+    tied = [camera for camera in CAMERAS
+            if CAMERA_GAP_COUNTS.get(camera) == top]
+    MASTER_CAMERA = tied[0] if tied else None
+    MASTER_SELECTION_REASON = 'most confirmed unique gaps (%d)' % top
+    return MASTER_CAMERA
+
+
+def set_master_camera():
+    '''Freeze the master timeline, exactly as the engine does.'''
+    global MASTER_TIMELINE, MASTER_GAP_COUNT, MASTER_POSITIONS
+    global MASTER_DURATIONS, MASTER_GAP_ID_LIST, GLOBAL_GAP_IDS
+    global GLOBAL_GAP_COUNT
+
+    MASTER_TIMELINE = GAP_TIMELINES[MASTER_CAMERA]
+    MASTER_GAP_COUNT = int(len(MASTER_TIMELINE))
+    if MASTER_GAP_COUNT == 0:
+        raise RuntimeError(
+            'Master camera %s produced 0 unique gaps' % MASTER_CAMERA)
+    MASTER_POSITIONS = MASTER_TIMELINE[
+        'normalized_confirmation_time'].to_numpy(dtype=float)
+    MASTER_DURATIONS = MASTER_TIMELINE[
+        'normalized_duration'].to_numpy(dtype=float)
+    MASTER_GAP_ID_LIST = list(MASTER_TIMELINE['local_gap_id'])
+    GLOBAL_GAP_IDS = ['GLOBAL_G%03d' % (index + 1)
+                      for index in range(MASTER_GAP_COUNT)]
+    GLOBAL_GAP_COUNT = MASTER_GAP_COUNT
 
 
 class CameraAlignment(object):
@@ -1038,9 +1079,35 @@ def test_assembly_produces_one_combined_report(stub_engine, inputs, tmp_path,
     assert result.report_pdf_path and os.path.isfile(result.report_pdf_path)
 
 
-def test_right_up_is_the_canonical_gap_authority():
-    assert C.MASTER_CAMERA == C.CAMERA_RIGHT_UP
-    assert global_assembly.required_cameras() == (C.CAMERA_RIGHT_UP,)
+def test_master_camera_is_chosen_the_way_batch_chooses_it():
+    """Batch has NO fixed master: the engine picks the max-unique-gaps camera.
+
+    Sequential must not substitute a fixed authority -- the global gap count IS
+    the master's gap count, so a different master means a different wagon
+    count. (An earlier version of this test asserted a fixed RIGHT_UP, which is
+    the RETAINED wagon_count engine's rule, not this engine's.)
+    """
+    import inspect
+
+    source = inspect.getsource(global_assembly.populate_engine_alignment_state)
+    assert "select_master_camera()" in source, (
+        "the master must be chosen by the engine, not by Sequential")
+    assert "set_master_camera()" in source
+
+    # a Batch-comparable assembly needs every camera, because the winner is
+    # not known until all of them are counted
+    assert global_assembly.required_cameras() == tuple(C.ALL_CAMERAS)
+
+    harvest_source = inspect.getsource(global_assembly.build_harvest)
+    assert "C.MASTER_CAMERA" not in harvest_source, (
+        "the harvest is still hardcoding a master camera")
+
+
+def test_assembly_is_not_batch_comparable_without_every_camera(tmp_path):
+    ready, _sealed, missing, reason = global_assembly.readiness(str(tmp_path))
+    assert ready is False
+    assert "not Batch-comparable" in reason
+    assert set(missing) == set(C.ALL_CAMERAS)
 
 
 def test_support_camera_extra_gap_is_diagnostic_not_a_wagon(stub_engine, inputs,
@@ -1049,16 +1116,17 @@ def test_support_camera_extra_gap_is_diagnostic_not_a_wagon(stub_engine, inputs,
     workspace = tmp_path / "ws"
     _seal_all(stub_engine, inputs, workspace, wired)
 
-    # Give LEFT_UP one extra local gap, far from any canonical position.
-    document = json.loads(open(ev.evidence_path(str(workspace),
-                                                C.CAMERA_LEFT_UP),
-                               encoding="utf-8").read())
-    document["gaps"].append({
+    # Give LEFT_UP an extra local gap while REMOVING another, so it still has
+    # fewer gaps than the master and cannot win master selection. The extra
+    # position must then stay diagnostic instead of creating a wagon.
+    path = ev.evidence_path(str(workspace), C.CAMERA_LEFT_UP)
+    document = json.loads(open(path, encoding="utf-8").read())
+    document["gaps"] = document["gaps"][:-2] + [{
         "local_gap_id": "LEFT_UP_EXTRA", "confirmation_frame": 40,
         "first_frame": 40, "last_frame": 40, "normalized_position": 700.0,
-        "max_confidence": 0.9, "average_confidence": 0.9, "frame_count": 1})
-    with open(ev.evidence_path(str(workspace), C.CAMERA_LEFT_UP), "w",
-              encoding="utf-8") as handle:
+        "max_confidence": 0.9, "average_confidence": 0.9, "frame_count": 1,
+        "normalized_duration": 5.0}]
+    with open(path, "w", encoding="utf-8") as handle:
         json.dump(document, handle)
 
     result = global_assembly.assemble(

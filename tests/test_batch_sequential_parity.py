@@ -442,8 +442,15 @@ def _write_camera(workspace, camera_id, positions):
 
 
 def _assemble(workspace, stub_engine_dir, layout):
-    for camera_id, positions in layout.items():
-        _write_camera(workspace, camera_id, positions)
+    """Seal every camera: the master is the camera with the MOST unique gaps,
+    so a Batch-comparable assembly cannot start until all four are known.
+
+    Cameras not named in `layout` are sealed with the canonical sequence, so
+    the named ones are the interesting variables.
+    """
+    for camera_id in C.ALL_CAMERAS:
+        _write_camera(workspace, camera_id,
+                      layout.get(camera_id, CANONICAL))
     return global_assembly.assemble(
         workspace=workspace, repo_root=_REPO_ROOT, batch_key="parity",
         engine_dir=stub_engine_dir, verbose=False)
@@ -613,9 +620,10 @@ def test_ownership_rule_holds_on_the_assembled_state(tmp_path,
 def test_observation_assignment_is_single_owner(tmp_path, stub_engine_dir):
     """A persisted observation may reach exactly one wagon."""
     workspace = str(tmp_path / "ws")
-    for camera_id, positions in ((C.CAMERA_RIGHT_UP, CANONICAL),
-                                 (C.CAMERA_LEFT_UP, CANONICAL)):
-        _write_camera(workspace, camera_id, positions)
+    # All four: the master is the camera with the most unique gaps, so a
+    # Batch-comparable assembly needs every camera sealed.
+    for camera_id in C.ALL_CAMERAS:
+        _write_camera(workspace, camera_id, CANONICAL)
 
     # Add door observations across the whole region, including exactly on gaps.
     document = json.loads(open(ev.evidence_path(workspace, C.CAMERA_LEFT_UP),
@@ -655,8 +663,8 @@ def test_final_wagon_assignment_produces_feature_payloads(tmp_path,
                                                           stub_engine_dir):
     """End of the chain: assigned evidence becomes per-wagon feature JSON."""
     workspace = str(tmp_path / "ws")
-    _write_camera(workspace, C.CAMERA_RIGHT_UP, CANONICAL)
-    _write_camera(workspace, C.CAMERA_RIGHT_UP_TOP, CANONICAL)
+    for camera_id in C.ALL_CAMERAS:
+        _write_camera(workspace, camera_id, CANONICAL)
 
     document = json.loads(open(
         ev.evidence_path(workspace, C.CAMERA_RIGHT_UP_TOP),

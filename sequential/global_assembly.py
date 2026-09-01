@@ -94,13 +94,19 @@ class AssemblyResult:
 # -----------------------------------------------------------------------------
 
 def required_cameras() -> Tuple[str, ...]:
-    """The cameras a canonical global train needs.
+    """The cameras a canonical global train needs to MATCH Batch.
 
-    RIGHT_UP is indispensable because it is the canonical gap authority.  The
-    support cameras improve the result but a train can be assembled without
-    all of them, so only the authority is strictly required.
+    Batch does not have a fixed master: `config.MASTER_CAMERA_SELECTION` is
+    "max_unique_gaps", so `select_master_camera()` picks whichever camera
+    confirmed the most unique gaps, and the global gap count IS that camera's
+    gap count. Which camera wins therefore cannot be known until every camera
+    has been processed -- so a Batch-comparable assembly needs all four sealed.
+
+    (Assembling from fewer is still possible and still produces one canonical
+    roster, but the master is then chosen from a smaller field and the result
+    is NOT comparable with a four-camera Batch run. `readiness()` says so.)
     """
-    return (C.MASTER_CAMERA,)
+    return tuple(C.ALL_CAMERAS)
 
 
 def readiness(workspace: str, *, cameras: Sequence[str] = C.ALL_CAMERAS,
@@ -108,11 +114,13 @@ def readiness(workspace: str, *, cameras: Sequence[str] = C.ALL_CAMERAS,
     """`(ready, sealed, missing, reason)` -- never fabricates."""
     sealed = ev.sealed_cameras(workspace, cameras)
     missing = [camera for camera in cameras if camera not in sealed]
-    for camera in required_cameras():
-        if camera not in sealed:
-            return (False, sealed, missing,
-                    "canonical gap authority %s is not sealed" % camera)
-    return (True, sealed, missing, "canonical authority sealed")
+    absent = [camera for camera in required_cameras() if camera not in sealed]
+    if absent:
+        return (False, sealed, missing,
+                "not Batch-comparable: %s not sealed, and the master camera is "
+                "the one with the most confirmed unique gaps, which cannot be "
+                "known until every camera is processed" % ", ".join(absent))
+    return (True, sealed, missing, "all cameras sealed")
 
 
 # -----------------------------------------------------------------------------
@@ -135,6 +143,22 @@ def _frame_for_position(camera_evidence: ev.CameraEvidence,
     return timing.wagon_region_start_frame + offset
 
 
+def _classification_frame(camera_evidence: ev.CameraEvidence):
+    """The persisted per-frame classification, shaped for Batch's helper.
+
+    `gc_runner._majority_class` filters a DataFrame on `frame_id` and reads
+    `normalized_class`, so the persisted timeline is handed to it in exactly
+    that shape rather than the vote being re-implemented.
+    """
+    import pandas as pd
+
+    records = camera_evidence.classification_timeline or []
+    if not records:
+        return None
+    return pd.DataFrame(records, columns=["frame_id", "normalized_class"]) \
+        if all("frame_id" in r for r in records[:1]) else None
+
+
 def _gap_frame(camera_evidence: ev.CameraEvidence):
     """One camera's persisted gap timeline as the DataFrame the engine expects."""
     import pandas as pd
@@ -148,7 +172,8 @@ def _gap_frame(camera_evidence: ev.CameraEvidence):
                 "normalized_duration"])
 
 
-def populate_engine_alignment_state(global_alignment, evidences, master_id):
+def populate_engine_alignment_state(global_alignment, evidences,
+                                    master_id=None):
     """Load the persisted timelines into the engine's alignment state.
 
     This is state population, NOT algorithm reimplementation: the engine's
@@ -161,31 +186,29 @@ def populate_engine_alignment_state(global_alignment, evidences, master_id):
     """
     import numpy as np
 
-    master_key = gc_runner.CAMERA_ID_TO_KEY[master_id]
-
     global_alignment.GAP_TIMELINES.clear()
     global_alignment.CAMERA_ALIGNMENTS.clear()
+    global_alignment.CAMERA_TIMELINE_INFO.clear()
     for camera_id, camera_evidence in evidences.items():
-        global_alignment.GAP_TIMELINES[
-            gc_runner.CAMERA_ID_TO_KEY[camera_id]] = _gap_frame(camera_evidence)
+        camera_key = gc_runner.CAMERA_ID_TO_KEY[camera_id]
+        global_alignment.GAP_TIMELINES[camera_key] = _gap_frame(camera_evidence)
+        # select_master_camera() reads gap_count from here.
+        global_alignment.CAMERA_TIMELINE_INFO[camera_key] = {
+            "gap_count": camera_evidence.unique_gap_count,
+            "trimmed_total_frames": camera_evidence.timing.wagon_region_frames,
+        }
 
-    master_frame = global_alignment.GAP_TIMELINES[master_key]
-    global_alignment.MASTER_CAMERA = master_key
-    global_alignment.MASTER_TIMELINE = master_frame
-    global_alignment.MASTER_GAP_COUNT = int(len(master_frame))
-    global_alignment.MASTER_POSITIONS = master_frame[
-        "normalized_confirmation_time"].to_numpy(dtype=float)
-    global_alignment.MASTER_DURATIONS = master_frame[
-        "normalized_duration"].to_numpy(dtype=float)
-    global_alignment.MASTER_GAP_ID_LIST = list(master_frame["local_gap_id"])
-    global_alignment.GLOBAL_GAP_IDS = [
-        "GLOBAL_G%03d" % (index + 1)
-        for index in range(global_alignment.MASTER_GAP_COUNT)]
-    global_alignment.GLOBAL_GAP_COUNT = global_alignment.MASTER_GAP_COUNT
+    # THE MASTER IS CHOSEN BY THE ENGINE, exactly as in Batch: the camera with
+    # the most confirmed unique gaps, ties broken by the engine's CAMERAS
+    # order. Sequential must not pick its own, or the global gap count -- which
+    # IS the master's gap count -- would differ from Batch.
+    global_alignment.select_master_camera()
+    global_alignment.set_master_camera()
+    master_key = global_alignment.MASTER_CAMERA
 
     # The master is aligned to itself by definition; `estimate_alignment`
     # returns this identity registration rather than matching it to itself.
-    identity = global_alignment.CameraAlignment(master_key, master_key)
+    identity = global_alignment.CameraAlignment(master_key, master_key)  # noqa: E501
     identity.scale, identity.offset = 1.0, 0.0
     identity.is_reversed = False
     identity.status = "MASTER"
@@ -271,13 +294,12 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
     `global_counting.adapter` means Sequential and Batch produce the identical
     canonical contract -- which is what makes the parity tests meaningful.
     """
-    master_id = C.MASTER_CAMERA
-    master = evidences[master_id]
-
-    # Load the persisted timelines into the engine's alignment state, then let
-    # the engine's own estimator decide each camera's direction and mapping.
+    # Load the persisted timelines, then let the ENGINE choose the master and
+    # freeze its timeline -- the same two calls Batch's Stage 1 makes.
     populate_engine_alignment_state(
-        engine["global_alignment"], evidences, master_id)
+        engine["global_alignment"], evidences, None)
+    master_id = gc_runner.CAMERA_KEY_TO_ID[engine["global_alignment"].MASTER_CAMERA]
+    master = evidences[master_id]
     canonical_positions = [float(p) for p in
                            engine["global_alignment"].MASTER_POSITIONS]
     gap_count = len(canonical_positions)
@@ -328,6 +350,12 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
             matched_gaps=int(alignment.get("matched_count", 0)))
 
     # ---- the ONE canonical roster: N gaps -> N-1 wagons ------------------
+    # Wagon classification uses Batch's OWN majority-vote helper over the
+    # master's persisted per-frame classification, so `regular_wagon_count`
+    # and every report row agree with Batch. Without this every wagon was
+    # UNKNOWN and the wagon KPI read zero.
+    master_timeline = _classification_frame(master)
+
     wagons: List[gc_runner.WagonHarvest] = []
     for index in range(max(0, gap_count - 1)):
         wagon = gc_runner.WagonHarvest(
@@ -359,6 +387,13 @@ def build_harvest(engine, evidences: Dict[str, ev.CameraEvidence],
                 "status": status,
                 "reversed": bool(alignment.get("is_reversed", False)),
                 "start_position": low_position, "end_position": high_position}
+        master_interval = wagon.cameras.get(master_id) or {}
+        if (master_interval.get("start_frame") is not None
+                and master_interval.get("end_frame") is not None):
+            wagon.classification, wagon.classification_confidence = \
+                gc_runner._majority_class(master_timeline,
+                                          master_interval["start_frame"],
+                                          master_interval["end_frame"])
         wagons.append(wagon)
 
     # Non-wagon objects outside the master's confirmed region, from the
