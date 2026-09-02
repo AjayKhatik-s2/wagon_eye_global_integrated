@@ -303,7 +303,18 @@ def publish(
                          _TAG, url, r.get("run_id"), r.get("segments_count"),
                          r.get("already_existed"))
         elif verbose:
-            log.warning("%s %s FAILED: %s", _TAG, url, r.get("error"))
+            # The response BODY, not just the status. `_post` has always
+            # captured it, but only `error` ("HTTP 409") was logged -- so a
+            # 12-train bulk run produced twelve identical lines that said the
+            # request was refused and nothing about why, and the reason had to
+            # be re-obtained by hand with a manual POST. The receiver explains
+            # itself in the body; print it.
+            detail = r.get("body") or r.get("detail") or r.get("message")
+            if detail:
+                log.warning("%s %s FAILED: %s -- %s", _TAG, url,
+                            r.get("error"), str(detail)[:300])
+            else:
+                log.warning("%s %s FAILED: %s", _TAG, url, r.get("error"))
     if verbose:
         log.info("%s", res.render())
     return res
