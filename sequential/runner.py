@@ -80,6 +80,74 @@ def resolve_reconstruction_models(recon_models_dir: str,
 # Delivery (Batch's Stage 6 / 6b / 6c, reached from the sequential flow)
 # -----------------------------------------------------------------------------
 
+def deliver_camera(result, *, workspace: str, batch_key: str,
+                   skip_upload: bool, verbose: bool = True) -> bool:
+    """Upload ONE camera's own report and evidence, the moment it seals.
+
+    Sequential's reason to exist is that a camera's findings are available as
+    soon as that camera is done, instead of after the slowest one. Holding the
+    upload until the end threw that away: the report existed on disk for up to
+    twenty minutes before anyone could reach it.
+
+    WHAT THIS DELIVERS, AND WHAT IT DELIBERATELY CANNOT
+    Only artifacts that belong to this camera alone and are final at seal time:
+    its own report (`camera_reports/<CAM>/`) and its own persisted evidence.
+
+    It does NOT run the per-camera DASHBOARD ingest. That document is built from
+    `report_doc["wagons"]` and the fused unified states -- deliberately, so all
+    four camera documents describe the SAME wagon sequence -- so it cannot exist
+    before the canonical roster does. Building one here would mean publishing a
+    document keyed to this camera's own local wagons, which is precisely the
+    "competing independent global wagon list" the architecture forbids. The
+    dashboard ingest therefore stays in `_deliver`, after assembly.
+
+    Idempotent: `_deliver` still uploads the whole tree afterwards and overwrites
+    these same keys. That final tree upload remains the authoritative state; this
+    is an early copy of a subset, not a replacement for it.
+
+    Returns True if anything was uploaded. Failure-isolated -- a camera whose
+    upload fails is still sealed, and the next camera still runs.
+    """
+    if skip_upload or not getattr(result, "sealed", False):
+        return False
+
+    from core import constants as C
+    from delivery import s3_upload
+
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=C.S3_REGION)
+    except Exception as exc:                                   # noqa: BLE001
+        print("[SEQ/%s] early delivery skipped, no S3 client: %s"
+              % (result.camera_id, exc), file=sys.stderr)
+        return False
+
+    cam = result.camera_id
+    uploaded = 0
+    # `camera_reports/<CAM>` and `evidence/<CAM>` if it exists -- sub_prefix
+    # mirrors the local layout, so these land on the same keys the final tree
+    # upload uses rather than a parallel set.
+    for subdir in ("%s/%s" % (ev.CAMERA_REPORTS_DIRNAME, cam),
+                   "%s/%s" % ("evidence", cam)):
+        local = os.path.join(workspace, subdir)
+        if not os.path.isdir(local):
+            continue
+        try:
+            uploaded += s3_upload.upload_tree(
+                s3, local, batch_key, sub_prefix=subdir)
+        except Exception as exc:                               # noqa: BLE001
+            print("[SEQ/%s] early upload of %s failed: %s" % (cam, subdir, exc),
+                  file=sys.stderr)
+
+    if verbose and uploaded:
+        print("[SEQ/%s] DELIVERED EARLY  %d file(s) -> s3://%s/%s/%s/"
+              % (cam, uploaded, C.S3_OUTPUT_BUCKET, C.S3_TRAIN_BATCH_PREFIX,
+                 batch_key))
+    elif verbose:
+        print("[SEQ/%s] nothing to deliver early (no report on disk yet)" % cam)
+    return uploaded > 0
+
+
 def _deliver(outcome, *, workspace: str, batch_key: str,
              skip_upload: bool, skip_email: bool, verbose: bool = True) -> None:
     """Upload this batch's artifacts, then feed both dashboard endpoints.
@@ -309,6 +377,16 @@ def run_sequential(
             result = camera_runner.CameraRunResult(
                 camera_id=camera_id, status=ev.STATUS_FAILED, reason=str(exc))
         outcome.cameras.append(result)
+
+        # Deliver THIS camera now, not after the slowest one. Failure-isolated
+        # inside `deliver_camera`, and re-uploaded by the final tree upload, so
+        # a receiver outage here costs an early copy and nothing else.
+        try:
+            deliver_camera(result, workspace=workspace, batch_key=batch_key,
+                           skip_upload=skip_upload, verbose=verbose)
+        except Exception as exc:                               # noqa: BLE001
+            print("[SEQ/%s] early delivery raised %s: %s"
+                  % (camera_id, type(exc).__name__, exc), file=sys.stderr)
 
     required = global_assembly.required_cameras()
     sealed = outcome.sealed_cameras

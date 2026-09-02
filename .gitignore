@@ -50,3 +50,6 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local Batch-vs-Sequential parity run outputs (multi-GB, reproducible)
+parity_runs/
