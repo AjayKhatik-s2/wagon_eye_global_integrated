@@ -355,13 +355,23 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
 
     if verbose:
         print("[SEQ] STAGE 5a camera reports (Batch's own renderer)")
+    # Resolved the way Batch resolves it (master_runner's `_logo_path`).
+    # Batch passes it to BOTH builders; Sequential passed it to neither, so
+    # every Sequential PDF rendered without the logo while Batch's carried it.
+    # `logo_path` defaults to None and the renderer honours that silently, so
+    # the omission produced a visibly different document from the SAME builder
+    # with no error anywhere -- the one class of parity break the field-level
+    # comparator cannot see, because it never opens a PDF.
+    logo_path = os.path.join(repo_root, "reporting", "assets", "Logo.jpeg")
+    if not os.path.isfile(logo_path):
+        logo_path = None
     camera_report_paths: Dict[str, Optional[str]] = {}
     try:
         camera_report_paths = camera_reports.build_all(
             state=state, unified=unified, evidence_root=evidence_root,
             wagon_states_root=states_root, cache_root=cache_root,
             per_camera_tracking_path=tracking_path, output_dir=reports_root,
-            batch_key=batch_key, verbose=verbose)
+            batch_key=batch_key, logo_path=logo_path, verbose=verbose)
     except Exception as exc:                                # pragma: no cover
         print("[SEQ/STAGE5a] camera reports FAILED: %s" % exc, file=sys.stderr)
 
@@ -407,6 +417,14 @@ def assemble(*, workspace: str, repo_root: str, batch_key: str,
         camera_pdf_urls={camera: os.path.basename(path)
                          for camera, path in camera_report_paths.items()
                          if path},
+        # Both were omitted. `missing_cameras` drives the report's warning
+        # banner and its per-camera "Click to View" cells, so a Sequential run
+        # with an absent camera rendered no warning where Batch renders one.
+        # Derived from the SEALED set, which is the only thing Sequential knows
+        # -- and it equals Batch's `batch.missing_cameras()` whenever the four
+        # required cameras are present, which the all-four gate guarantees.
+        missing_cameras=[c for c in C.ALL_CAMERAS if c not in evidences],
+        logo_path=logo_path,
         verbose=verbose)
 
     diagnostics = {

@@ -24,7 +24,6 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-from core import constants as C
 
 from sequential import evidence as ev
 
@@ -85,10 +84,21 @@ def build_document(camera_evidence: ev.CameraEvidence, *, batch_key: str,
             "wagon_region_end_frame": timing.wagon_region_end_frame,
             "wagon_region_frames": timing.wagon_region_frames,
         },
+        # NO global-authority claim. `C.MASTER_CAMERA` is a static constant
+        # (RIGHT_UP), but the real master is whichever camera has the most
+        # confirmed unique gaps -- selected in Global Assembly, and on real
+        # footage it is often NOT RIGHT_UP. Labelling RIGHT_UP the "canonical
+        # gap authority" here was therefore a global claim inside a
+        # camera-local document, wrong on any train whose master is another
+        # camera, and it demoted the other three to "corroborating evidence
+        # only" when in Phase 1 all four cameras are equal and independent.
+        #
+        # In Phase 1 no camera is the authority. That is decided once, later,
+        # from all four sealed evidences.
         "gap_authority": (
-            "canonical gap authority (RIGHT_UP)"
-            if camera_evidence.camera_id == C.MASTER_CAMERA
-            else "support camera: corroborating evidence only"),
+            "none in this phase: every camera reports independently, and the "
+            "master camera is selected in Global Assembly from all four "
+            "sealed evidences (most confirmed unique gaps)"),
         "local_gaps": {
             "count": camera_evidence.unique_gap_count,
             "gaps": [

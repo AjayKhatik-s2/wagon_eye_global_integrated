@@ -818,8 +818,16 @@ def _process_batch_sequential(
     config = feature_config or FeatureConfig.all_on()
     options = inference_opts or {}
 
+    # ARRIVAL order for Sequential: S3 LastModified is when the clip actually
+    # landed, which is the signal Sequential's camera order is meant to follow.
+    # A camera whose CameraVideo carries no timestamp contributes None and sorts
+    # after those that do, rather than being given a fabricated time.
+    arrival = {cam: (cv.last_modified if cam in video_paths else None)
+               for cam, cv in batch.videos.items() if cam in video_paths}
+
     outcome = sequential_runner.run_sequential(
         video_paths=video_paths,
+        arrival=arrival,
         workspace=batch_root,
         repo_root=_REPO_ROOT,
         recon_models_dir=recon_models_dir,

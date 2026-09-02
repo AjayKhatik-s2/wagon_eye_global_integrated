@@ -275,13 +275,63 @@ def _send_email(outcome, *, batch_key: str, verbose: bool = True) -> None:
 
 
 def camera_order(video_paths: Dict[str, str],
-                 cameras: Sequence[str] = C.ALL_CAMERAS) -> List[str]:
-    """Deterministic processing order from the authoritative configuration.
+                 cameras: Sequence[str] = C.ALL_CAMERAS,
+                 arrival: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Processing order = ARRIVAL order. Ties and unknowns fall back to config.
 
-    `C.ALL_CAMERAS` -- RIGHT_UP, LEFT_UP, RIGHT_UP_TOP, LEFT_UP_TOP -- never
-    filesystem order, so two runs on the same inputs process in the same order.
+    Sequential models a real pipeline: the camera whose video arrives first is
+    processed first. A fixed RIGHT_UP-first order was wrong for that -- it made
+    the first camera's identity a property of the configuration rather than of
+    when its clip landed.
+
+    `arrival` is {camera_id: sortable}, and the two real signals are already in
+    the system:
+
+        S3 / --historical   CameraVideo.last_modified  (upload time = arrival)
+        --local-only        the video file's mtime
+
+    A directory has no arrival order of its own, and `scan_local_video_dir`
+    destroys any it might have had -- it sorts its candidates and then walks the
+    camera aliases LONGEST FIRST, so its dict is in alias-resolution order
+    (RIGHT_UP_TOP, LEFT_UP_TOP, RIGHT_UP, LEFT_UP). Reading insertion order as
+    arrival would therefore be a fiction, which is why an explicit signal is
+    required rather than inferred.
+
+    Cameras with no signal sort AFTER those that have one, in `cameras` order,
+    and equal timestamps break by `cameras` order -- so the result is always
+    total and reproducible. Two runs over the same inputs process identically.
+
+    This changes only WHEN each camera runs. Phase 2 restores evidence via
+    `ev.sealed_cameras`, which iterates `C.ALL_CAMERAS`, so the master camera,
+    the canonical roster and every global value are unaffected by this order --
+    the property `--mode sequential` is required to hold.
     """
-    return [camera_id for camera_id in cameras if camera_id in video_paths]
+    present = [camera_id for camera_id in cameras if camera_id in video_paths]
+    if not arrival:
+        return present
+    rank = {camera_id: index for index, camera_id in enumerate(cameras)}
+    # Unknowns are partitioned out rather than sorted with a sentinel: mixing
+    # None into the sort key raises on some signal types and silently orders
+    # first on others.
+    known = [c for c in present if arrival.get(c) is not None]
+    unknown = [c for c in present if arrival.get(c) is None]
+    known.sort(key=lambda c: (arrival[c], rank[c]))
+    return known + unknown
+
+
+def arrival_from_files(video_paths: Dict[str, str]) -> Dict[str, Any]:
+    """{camera_id: mtime} -- the local analogue of an upload time.
+
+    A missing or unreadable file yields no signal for that camera rather than a
+    fabricated one, so it sorts last instead of first.
+    """
+    out: Dict[str, Any] = {}
+    for camera_id, path in video_paths.items():
+        try:
+            out[camera_id] = os.path.getmtime(path)
+        except OSError:
+            out[camera_id] = None
+    return out
 
 
 def run_sequential(
@@ -295,6 +345,7 @@ def run_sequential(
     batch_key: str,
     engine_dir: Optional[str] = None,
     source_video_urls: Optional[Dict[str, str]] = None,
+    arrival: Optional[Dict[str, Any]] = None,
     door_stride: int = 3,
     damage_stride: int = 3,
     load_stride: int = 2,
@@ -308,7 +359,10 @@ def run_sequential(
     verbose: bool = True,
 ) -> SequentialOutcome:
     started = time.time()
-    order = camera_order(video_paths)
+    # No explicit signal -> derive one from the files themselves, so a
+    # --local-only run still follows arrival rather than configuration.
+    order = camera_order(video_paths,
+                         arrival=arrival or arrival_from_files(video_paths))
     outcome = SequentialOutcome(batch_key=batch_key, workspace=workspace)
 
     selected = list(features)
