@@ -124,16 +124,48 @@ def test_assembly_passes_the_same_contract_batch_passes():
 
 
 def test_sequential_defines_no_second_per_wagon_camera_report():
-    """The camera-local report must not grow into a rival of the validated one."""
-    raw = inspect.getsource(sequential_camera_report)
-    # Strip docstrings: the module docstring legitimately NAMES the validated
-    # renderer to explain why it is not reused.
-    code = _strip_docstrings(raw)
-    for banned in ("state.wagons", "UnifiedWagonState", "unified[",
-                   "wagon_cache", "evidence_snapshot", "camera_reports"):
+    """The camera-local report must not RIVAL the validated one -- it must CALL it.
+
+    REWRITTEN, deliberately. The previous version banned the name
+    `camera_reports` from this module, on the reasoning that the camera-local
+    report should stay separate from the validated renderer. The requirement is
+    now the opposite: the Phase-1 camera report must BE Batch's camera report,
+    rendered from camera-local data, so that a camera's inspection report has
+    the same sections, layout, labels and evidence presentation as Batch's.
+
+    The original intent -- no second implementation of per-wagon rendering --
+    is preserved and in fact enforced more strictly: the module must call
+    Batch's builders and must not define page, table or item-assembly logic of
+    its own. What changed is that reuse is now the requirement rather than the
+    thing being guarded against.
+    """
+    code = _strip_docstrings(inspect.getsource(sequential_camera_report))
+
+    # It must REUSE, not reimplement.
+    assert "camera_reports.build_camera_report(" in code, (
+        "the Phase-1 report must render through Batch's own camera renderer")
+    assert "camera_reports._build_camera_items(" in code, (
+        "the Phase-1 JSON must serialize Batch's own per-wagon item list")
+
+    # And it must not grow its own per-wagon rendering. These are the section
+    # builders that belong to the validated renderer alone.
+    for banned in ("_camera_summary_page", "_camera_wagon_pages",
+                   "_camera_evidence_pages", "_camera_anomaly_summary",
+                   "_camera_detection_summary_rows", "def _build_camera_items"):
         assert banned not in code, (
-            "the camera-local report is reaching into global territory: %r"
-            % banned)
+            "the camera-local report is reimplementing %r instead of calling "
+            "the validated renderer" % banned)
+
+
+def test_sequential_camera_report_uses_only_camera_local_ids():
+    """Reusing Batch's renderer must not import Batch's canonical roster.
+
+    The renderer addresses wagons by `wagon.global_id`; Phase 1 supplies
+    camera-local ids. Nothing here may construct or expect a `GW_n`.
+    """
+    code = _strip_docstrings(inspect.getsource(sequential_camera_report))
+    assert '"GW_' not in code and "'GW_" not in code
+    assert "GW_%d" not in code
 
 
 def test_validated_report_filenames_are_batchs(tmp_path):

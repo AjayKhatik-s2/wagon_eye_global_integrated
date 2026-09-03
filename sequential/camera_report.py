@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any, Dict, List, Optional
 
 
 from sequential import evidence as ev
+
+#: Repo root, for resolving the shared report logo the way Batch does.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TITLE = "Single-Camera Evidence Report"
 NOT_CANONICAL = (
@@ -63,7 +67,69 @@ def _observation_summary(camera_evidence: ev.CameraEvidence) -> Dict[str, Any]:
     return summary
 
 
+def _inspection_items(camera_id: str, local_state,
+                      local_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The SAME per-wagon item list Batch's camera PDF renders from.
+
+    `camera_reports._build_camera_items` is Batch's own function -- it produces
+    `{sr, gw_id, classification, classification_conf, visible, detections,
+    anomalies, primary_confidence}` per wagon, where `detections` carries the
+    Door / Load / Damage labels, states, confidences and snapshot paths.
+
+    Serializing that list is what makes the camera JSON the complete inspection
+    record rather than a parallel invention: the JSON and the PDF then describe
+    the same wagons with the same verdicts, because they come from one call.
+
+    Batch has no camera-report JSON of its own, so there is no Batch JSON
+    contract this could match -- this is Sequential-defined, built from Batch's
+    data.
+    """
+    if local_state is None or not local_result:
+        return []
+    unified = local_result.get("unified") or {}
+    if not unified:
+        return []
+    paths = local_result.get("paths") or {}
+    try:
+        from reporting import camera_reports
+        items = camera_reports._build_camera_items(
+            camera_id=camera_id, state=local_state, unified=unified,
+            evidence_root=paths.get("evidence_root"),
+            wagon_states_root=paths.get("states_root"),
+            cache_root=paths.get("cache_root"))
+    except Exception as exc:                                # pragma: no cover
+        print("[SEQ/P1/%s] item build FAILED: %s" % (camera_id, exc),
+              file=sys.stderr)
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        out.append({
+            "sr": item.get("sr"),
+            # This camera's OWN wagon id. The key keeps Batch's name so the
+            # shape matches, but the VALUE is local (`LEFT_UP_W1`).
+            "local_wagon_id": item.get("gw_id"),
+            "classification": item.get("classification"),
+            "classification_confidence": item.get("classification_conf"),
+            "visible": item.get("visible"),
+            "primary_confidence": item.get("primary_confidence"),
+            # [(label, state, confidence, snapshot_path), ...] -- the Door /
+            # Load / Damage results, with their evidence frame references.
+            "detections": [
+                {"label": d[0], "state": d[1], "confidence": d[2],
+                 "snapshot": d[3]}
+                for d in (item.get("detections") or []) if len(d) >= 4
+            ],
+            "anomalies": [{"severity": a[0], "text": a[1]}
+                          for a in (item.get("anomalies") or [])
+                          if len(a) >= 2],
+        })
+    return out
+
+
 def build_document(camera_evidence: ev.CameraEvidence, *, batch_key: str,
+                   local_state=None,
+                   local_result: Optional[Dict[str, Any]] = None,
                    ) -> Dict[str, Any]:
     """The camera-local JSON report."""
     timing = camera_evidence.timing
@@ -116,6 +182,17 @@ def build_document(camera_evidence: ev.CameraEvidence, *, batch_key: str,
             "segments": camera_evidence.segments,
         },
         "observations": _observation_summary(camera_evidence),
+        # The complete per-wagon inspection record, from Batch's own item
+        # builder -- Door / Load / Damage verdicts, confidences, evidence
+        # snapshots and anomalies, per CAMERA-LOCAL wagon.
+        "inspection": {
+            "wagons": _inspection_items(camera_evidence.camera_id, local_state,
+                                        local_result or {}),
+            "note": "camera-local wagons between this camera's own confirmed "
+                    "gaps; verdicts computed on those windows. The canonical "
+                    "train and its GW_n roster are built in Global Assembly.",
+        },
+        "phase1_timings": dict((local_result or {}).get("timings") or {}),
         "feature_config": camera_evidence.feature_config,
         "provenance": camera_evidence.provenance,
         "diagnostics": camera_evidence.diagnostics,
@@ -251,22 +328,87 @@ def _build_pdf(document: Dict[str, Any], output_pdf: str,
     return output_pdf
 
 
+def _batch_rendered_pdf(*, workspace: str, camera_id: str, batch_key: str,
+                        local_state, local_result: Dict[str, Any],
+                        output_pdf: str, verbose: bool) -> Optional[str]:
+    """Render the camera report with BATCH'S OWN renderer, camera-locally.
+
+    `reporting.camera_reports.build_camera_report` is the report Batch produces:
+    the summary KPI page, the detection summary, the anomaly summary, the
+    evidence pages and the per-wagon pages. It takes `state` and `unified` and
+    addresses everything by `wagon.global_id`, so handing it a camera-local
+    state and that camera's own fused states yields the SAME report -- the same
+    sections, layout, labels and evidence presentation -- naming this camera's
+    own wagons instead of canonical ones.
+
+    Nothing about the renderer is forked. This is a call, not a copy.
+
+    Returns None when the local state or fusion is unavailable, and the caller
+    then falls back to the camera-local counting report: a camera with fewer
+    than two confirmed gaps bounds no wagon, so there is nothing for a
+    wagon-oriented report to describe, and inventing a page for it would be
+    worse than not rendering one.
+    """
+    if local_state is None or not local_result:
+        return None
+    unified = local_result.get("unified") or {}
+    if not unified:
+        return None
+    paths = local_result.get("paths") or {}
+    try:
+        from reporting import camera_reports
+        # Resolved the way Batch resolves it, so the Phase-1 report carries the
+        # same logo as every other report in the system.
+        logo = os.path.join(_REPO_ROOT, "reporting", "assets", "Logo.jpeg")
+        return camera_reports.build_camera_report(
+            camera_id=camera_id,
+            state=local_state,
+            unified=unified,
+            evidence_root=paths.get("evidence_root"),
+            wagon_states_root=paths.get("states_root"),
+            cache_root=paths.get("cache_root"),
+            per_camera_tracking_path=paths.get("tracking_path"),
+            output_pdf=output_pdf,
+            batch_key=batch_key,
+            logo_path=logo if os.path.isfile(logo) else None,
+            verbose=verbose,
+        )
+    except Exception as exc:                                # pragma: no cover
+        print("[SEQ/P1/%s] Batch camera renderer FAILED: %s"
+              % (camera_id, exc), file=sys.stderr)
+        return None
+
+
 def build(*, workspace: str, evidence: ev.CameraEvidence, batch_key: str,
+          local_state=None, local_result: Optional[Dict[str, Any]] = None,
           verbose: bool = True) -> Dict[str, Optional[str]]:
-    """Write `<CAMERA>_report.json` and `<CAMERA>_report.pdf`."""
+    """Write `<CAMERA>_report.json` and `<CAMERA>_report.pdf`.
+
+    The PDF is Batch's own camera-report renderer whenever this camera produced
+    local wagons and fused states; otherwise it is the camera-local counting
+    report, which is all a camera with no bounded wagon can honestly show.
+    """
     directory = ev.camera_report_dir(workspace, evidence.camera_id)
     os.makedirs(directory, exist_ok=True)
+    local_result = local_result or {}
 
-    document = build_document(evidence, batch_key=batch_key)
+    document = build_document(evidence, batch_key=batch_key,
+                              local_state=local_state,
+                              local_result=local_result)
     json_path = os.path.join(directory, "%s_report.json" % evidence.camera_id)
     with open(json_path, "w", encoding="utf-8") as handle:
         json.dump(document, handle, indent=2, default=str)
 
-    pdf_path = None
+    output_pdf = os.path.join(directory, "%s_report.pdf" % evidence.camera_id)
+    pdf_path = _batch_rendered_pdf(
+        workspace=workspace, camera_id=evidence.camera_id, batch_key=batch_key,
+        local_state=local_state, local_result=local_result,
+        output_pdf=output_pdf, verbose=verbose)
+    if pdf_path:
+        return {"json_path": json_path, "pdf_path": pdf_path}
+
     try:
-        pdf_path = _build_pdf(
-            document, os.path.join(directory, "%s_report.pdf"
-                                   % evidence.camera_id), verbose)
+        pdf_path = _build_pdf(document, output_pdf, verbose)
     except Exception as exc:                                # pragma: no cover
         print("[SEQ/%s] camera PDF failed: %s" % (evidence.camera_id, exc))
 

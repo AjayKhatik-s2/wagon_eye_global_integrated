@@ -45,7 +45,9 @@ cache, through Batch's own processors.
 from __future__ import annotations
 
 import gc
+import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +99,11 @@ class CameraRunResult:
     report_paths: Dict[str, Optional[str]] = field(default_factory=dict)
     seconds: float = 0.0
     unique_gap_count: int = 0
+    # Per-stage Phase-1 cost, so the price of camera-local features is
+    # measurable per model rather than hidden in one total.
+    phase1_timings: Dict[str, float] = field(default_factory=dict)
+    #: This camera's OWN wagon count. Cameras may legitimately disagree.
+    local_wagon_count: int = 0
 
     @property
     def sealed(self) -> bool:
@@ -363,10 +370,54 @@ def process_camera(
 
     evidence_file = ev.write_evidence(workspace, camera_evidence)
 
+    # ---- Phase 1: Batch's Stage 2/3/4 on THIS camera's own windows --------
+    # The camera can only carry a complete inspection report if its features
+    # have actually run, and they can only run against a state whose wagons
+    # carry frame windows. `local_state_adapter` supplies exactly that from the
+    # evidence just persisted -- camera-local ids, no canonical roster.
+    #
+    # Everything lands under camera_local/<CAMERA>/, isolated from the canonical
+    # trees Phase 2 builds and the Stage-6 upload mirrors.
+    #
+    # Failure-isolated: if any of this fails the camera still seals with its
+    # counting evidence, and the report degrades rather than the run dying.
+    from sequential import camera_features, local_state_adapter
+
+    local_state = None
+    local_result: Dict[str, Any] = {}
+    try:
+        local_state = local_state_adapter.build_local_state(camera_evidence)
+    except Exception as exc:                                   # noqa: BLE001
+        print("[SEQ/P1] local state FAILED for %s: %s" % (camera_id, exc),
+              file=sys.stderr)
+
+    if local_state is not None:
+        paths = camera_features.paths_for(workspace, camera_id)
+        os.makedirs(paths["root"], exist_ok=True)
+        # The four values Batch's renderer reads via load_per_camera_meta, from
+        # this camera's own persisted evidence. No global data involved.
+        try:
+            with open(paths["tracking_path"], "w", encoding="utf-8") as handle:
+                json.dump(local_state_adapter.per_camera_tracking_document(
+                    camera_evidence), handle, indent=2)
+        except OSError as exc:
+            print("[SEQ/P1] tracking doc FAILED for %s: %s"
+                  % (camera_id, exc), file=sys.stderr)
+        local_result = camera_features.run_camera_local(
+            state=local_state, camera_id=camera_id, video_path=video_path,
+            workspace=workspace, feat_models_dir=feat_models_dir,
+            features=features, fps=timing.fps,
+            door_stride=door_stride, damage_stride=damage_stride,
+            load_stride=load_stride, verbose=verbose)
+    elif verbose:
+        print("[SEQ/P1/%s] fewer than two confirmed gaps -- no local wagon to "
+              "inspect, so no feature stage and a counting-only report"
+              % camera_id)
+
     from sequential import camera_report
     report_paths = camera_report.build(
         workspace=workspace, evidence=camera_evidence, batch_key=batch_key,
-        verbose=verbose)
+        local_state=local_state, local_result=local_result, verbose=verbose)
 
     seal_file = ev.write_seal(
         workspace, camera_id=camera_id, status=status, timing=timing,
@@ -388,7 +439,9 @@ def process_camera(
         camera_id=camera_id, status=status, reused=False,
         reason=decision.reason, evidence_path=evidence_file,
         seal_path=seal_file, report_paths=report_paths,
-        seconds=time.time() - started, unique_gap_count=len(gaps))
+        seconds=time.time() - started, unique_gap_count=len(gaps),
+        phase1_timings=dict(local_result.get("timings") or {}),
+        local_wagon_count=(len(local_state.wagons) if local_state else 0))
 
 
 def _release() -> None:
