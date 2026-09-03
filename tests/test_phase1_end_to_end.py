@@ -62,14 +62,16 @@ def _stub_stages(monkeypatch, *, cache=None, feature=None, fusion=None):
     from fusion import wagon_state_builder
     from orchestrator import master_runner
 
-    class _Res:
-        frames_written = 10
-        per_camera_total = {CAM: 10}
-        missing_cameras = []
-        elapsed_seconds = 0.0
+    # The REAL dataclass, real shape: frames_written is
+    # {gw_id -> {camera_id -> n}}. A scalar stub hid a %d-vs-dict crash.
+    from materializer.wagon_cache_builder import CacheBuildResult
 
-    monkeypatch.setattr(wagon_cache_builder, "build",
-                        cache or (lambda **kw: _Res()))
+    def _res(**kw):
+        return CacheBuildResult(
+            cache_root="/x", frames_written={"RIGHT_UP_W1": {CAM: 10}},
+            per_camera_total={CAM: 10})
+
+    monkeypatch.setattr(wagon_cache_builder, "build", cache or _res)
     monkeypatch.setattr(master_runner, "load_feature_runner",
                         feature or (lambda name: (lambda **kw: {"x": name})))
     monkeypatch.setattr(wagon_state_builder, "build",

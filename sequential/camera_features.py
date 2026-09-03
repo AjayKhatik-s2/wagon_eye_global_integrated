@@ -144,15 +144,22 @@ def run_camera_local(
             camera_offsets={camera_id: 0.0},
             verbose=verbose,
         )
-        # The real fields on CacheBuildResult -- there is no `.counts`, and a
-        # getattr default would have reported an empty cache as success.
+        # `frames_written` is Dict[gw_id -> Dict[camera_id -> n_frames]], NOT
+        # a scalar. Both are kept: the nested map is the real per-wagon,
+        # per-camera record and is worth persisting for diagnosis, while
+        # `total_frames` is the scalar a log line or a summary needs.
+        #
+        # `total_frames()` is CacheBuildResult's OWN accessor
+        # (sum of per_camera_total), so the number reported here is the same
+        # number Batch would report rather than a re-derivation.
         cache_stats = {
-            "frames_written": getattr(result, "frames_written", 0),
+            "frames_written": dict(getattr(result, "frames_written", {}) or {}),
+            "total_frames": int(result.total_frames()),
             "per_camera_total": dict(getattr(result, "per_camera_total", {})
                                      or {}),
             "missing_cameras": list(getattr(result, "missing_cameras", [])
                                     or []),
-            "elapsed_seconds": getattr(result, "elapsed_seconds", 0.0),
+            "elapsed_seconds": float(getattr(result, "elapsed_seconds", 0.0)),
         }
     except Exception as exc:                                   # noqa: BLE001
         print("[SEQ/P1] wagon cache FAILED for %s: %s" % (camera_id, exc),
@@ -231,7 +238,13 @@ def run_camera_local(
         print("[SEQ/P1/%s] cache=%.1fs (%d frames) %s fusion=%.1fs  "
               "local wagons=%d"
               % (camera_id, timings.get("cache", 0.0),
-                 cache_stats.get("frames_written", 0),
+                 # The SCALAR, not the nested per-wagon map: formatting
+                 # `frames_written` with %d raised
+                 #   TypeError: %d format: a real number is required, not dict
+                 # after fusion had already succeeded, so a camera whose whole
+                 # Phase-1 pipeline had completed was marked FAILED and
+                 # reprocessed. A log statement must never be able to do that.
+                 cache_stats.get("total_frames", 0),
                  " ".join("%s=%.1fs" % (n.split("_", 1)[1], v)
                           for n, v in sorted(timings.items())
                           if n.startswith("feature_")),

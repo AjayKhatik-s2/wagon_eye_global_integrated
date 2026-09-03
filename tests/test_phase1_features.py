@@ -85,11 +85,14 @@ def _stub_everything(monkeypatch, order_sink=None):
     """Replace the models, keep the orchestration under test."""
     from materializer import wagon_cache_builder
 
-    class _Res:
-        frames_written = 42
-        per_camera_total = {CAM: 42}
-        missing_cameras = []
-        elapsed_seconds = 0.1
+    # Shaped like the REAL CacheBuildResult: frames_written is
+    # {gw_id -> {camera_id -> n}}, never a scalar. A stub with the wrong type
+    # is how a %d-vs-dict crash reached EC2 with a green suite.
+    from materializer.wagon_cache_builder import CacheBuildResult
+    _Res = lambda: CacheBuildResult(
+        cache_root="/x",
+        frames_written={"LEFT_UP_W1": {CAM: 21}, "LEFT_UP_W2": {CAM: 21}},
+        per_camera_total={CAM: 42}, missing_cameras=[], elapsed_seconds=0.1)
 
     monkeypatch.setattr(wagon_cache_builder, "build", lambda **kw: _Res())
 
@@ -135,13 +138,12 @@ def test_the_same_kwargs_batch_passes(tmp_path, local_state, monkeypatch):
     seen = {}
     from materializer import wagon_cache_builder
 
-    class _Res:
-        frames_written = 1
-        per_camera_total = {}
-        missing_cameras = []
-        elapsed_seconds = 0.0
-
-    monkeypatch.setattr(wagon_cache_builder, "build", lambda **kw: _Res())
+    from materializer.wagon_cache_builder import CacheBuildResult
+    monkeypatch.setattr(wagon_cache_builder, "build",
+                        lambda **kw: CacheBuildResult(
+                            cache_root="/x",
+                            frames_written={"LEFT_UP_W1": {CAM: 1}},
+                            per_camera_total={CAM: 1}))
     from orchestrator import master_runner
     monkeypatch.setattr(master_runner, "load_feature_runner",
                         lambda name: (lambda **kw: seen.update({name: kw})))
@@ -243,5 +245,7 @@ def test_cache_stats_come_from_the_real_result_fields(tmp_path, local_state,
                              video_path="/v.mp4", workspace=str(tmp_path),
                              feat_models_dir="/m", features=["door"],
                              fps=15.0, verbose=False)
-    assert out["cache"]["frames_written"] == 42
+    assert out["cache"]["total_frames"] == 42          # the SCALAR
+    assert out["cache"]["frames_written"] == {          # the per-wagon map
+        "LEFT_UP_W1": {CAM: 21}, "LEFT_UP_W2": {CAM: 21}}
     assert out["cache"]["per_camera_total"] == {CAM: 42}
